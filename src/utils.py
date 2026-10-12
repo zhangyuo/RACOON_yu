@@ -11,6 +11,7 @@ import openai
 import ast
 import re
 from collections import defaultdict, Counter
+from wikidata_api import fetch_entities
 data_dir = os.getenv('DATA_DIR', './data')
 
 # RAG4CTA addition: Wikidata's public SPARQL endpoint (query.wikidata.org) currently
@@ -203,58 +204,14 @@ def _fetch_entity_full(qid):
     if qid in _entity_full_cache:
         return _entity_full_cache[qid]
 
-    sparql = SPARQLWrapper("http://query.wikidata.org/sparql")
-    sparql.setQuery(f"""SELECT ?itemLabel ?itemDescription ?type ?typeLabel ?pq_obj ?pq_objLabel
-       WHERE {{
-       BIND(wd:{qid} AS ?item)
-       OPTIONAL {{
-           wd:{qid} p:P31 ?statementNode.
-           ?statementNode ps:P31 ?type.
-           OPTIONAL {{
-              ?statementNode pq:P642 ?pq_obj.
-           }}
-       }}
-       SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
-       }}
-       """)
-    sparql.setReturnFormat(JSON)
-
+    # RAG4CTA: one batched Action-API request (wikidata_api.py) instead of a SPARQL query on
+    # query.wikidata.org, which is rate limited to 1 request/minute. Same record format plus extra fields.
     try:
-        ret = sparql.query()
-        data = ret.convert()["results"]["bindings"]
+        result = fetch_entities([qid]).get(qid)
     except Exception:
         return None
-
-    if not data:
+    if result is None:
         return None
-
-    label = data[0].get("itemLabel", {}).get("value", "")
-    description = data[0].get("itemDescription", {}).get("value", "")
-
-    qids, entity_set, raw_bindings = [], set(), []
-    for binding in data:
-        if "type" not in binding:
-            continue  # the OPTIONAL P31 block matched nothing for this row
-        entry = {
-            "type_qid": binding["type"]["value"].split("/")[-1],
-            "type_label": binding["typeLabel"]["value"],
-        }
-        if "pq_obj" in binding:
-            entry["pq_obj_qid"] = binding["pq_obj"]["value"].split("/")[-1]
-            entry["pq_obj_label"] = binding["pq_objLabel"]["value"]
-        raw_bindings.append(entry)
-        if "pq_obj" in binding:
-            qids.append(entry["pq_obj_qid"]); entity_set.add(entry["pq_obj_label"])
-        else:
-            qids.append(entry["type_qid"]); entity_set.add(entry["type_label"])
-
-    result = {
-        "label": label,
-        "description": description,
-        "qids": qids,
-        "entity_set": list(entity_set),
-        "raw_bindings": raw_bindings,
-    }
     _entity_full_cache[qid] = result
     _save_entity_full_cache()
     return result
