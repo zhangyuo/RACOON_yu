@@ -25,9 +25,19 @@ import urllib.request
 API = "https://www.wikidata.org/w/api.php"
 UA = "RACOON-baseline/0.1 (af62lp@cs.aau.dk)"
 BATCH = 50
-MAX_STATEMENTS = 100
+MAX_STATEMENTS = 30    # item / coordinate statements kept per entity (the MCP config of RAG4CTA keeps 15 lines)
+MAX_PER_PROPERTY = 3   # values kept per property: some properties have thousands of values (e.g. P6379 of New York)
+MAX_PARENTS = 20       # P31 / P279 parents listed per entity or type
 
 _labels = {}  # id -> English label, shared by all calls in this process
+EN = ("en", "mul", "en-gb", "en-ca", "en-us")  # languagefallback may hand back another language: only English counts
+
+
+def _en(entry):
+    """Value of a label/description/alias entry if it is English (or language-neutral "mul"), else None."""
+    if entry and entry.get("language", "en") in EN:
+        return entry.get("value")
+    return None
 
 
 class NoSuchEntity(ValueError):
@@ -96,7 +106,7 @@ def _entities(ids, props, **extra):
 def _ensure_labels(ids):
     todo = [i for i in dict.fromkeys(ids) if i and i not in _labels]
     for k, e in _entities(todo, "labels").items():
-        _labels[k] = e.get("labels", {}).get("en", {}).get("value", k)
+        _labels[k] = _en(e.get("labels", {}).get("en")) or k
     for i in todo:
         _labels.setdefault(i, i)  # like the SPARQL label service: unlabeled -> the id itself
 
@@ -114,6 +124,27 @@ def _ref(qid):
     return {"qid": qid, "label": _labels[qid]}
 
 
+def _parents(e, pid):
+    return [q for q in (_qid(c["mainsnak"]) for c in _claims(e, pid)) if q][:MAX_PARENTS]
+
+
+def _storable(c):
+    dv = c["mainsnak"].get("datavalue")
+    return bool(dv) and dv.get("type") in ("wikibase-entityid", "globecoordinate")
+
+
+def _kept_statements(e):
+    """(pid, claim) pairs stored under "statements": P31 first, then the other properties by number; only item-valued and
+    coordinate claims, at most MAX_PER_PROPERTY values per property and MAX_STATEMENTS in total."""
+    kept = []
+    for pid in sorted(e.get("claims", {}), key=lambda p: (p != "P31", int(p[1:]))):
+        for c in [c for c in e["claims"][pid] if _storable(c)][:MAX_PER_PROPERTY]:
+            if len(kept) >= MAX_STATEMENTS:
+                return kept
+            kept.append((pid, c))
+    return kept
+
+
 def fetch_entities(qids):
     """{qid: record} for every QID that exists. Raises RuntimeError if the API keeps failing."""
     qids = list(dict.fromkeys(qids))
@@ -125,24 +156,20 @@ def fetch_entities(qids):
     # every id whose English label is needed, fetched in as few requests as possible
     need = set(type_ids)
     for e in ents.values():
-        for pid, cl in e.get("claims", {}).items():
-            for c in cl[:MAX_STATEMENTS]:
-                v = _qid(c["mainsnak"])
-                if v:
-                    need.update((pid, v))
-                elif c["mainsnak"].get("datavalue", {}).get("type") == "globecoordinate":
-                    need.add(pid)
-                for q in c.get("qualifiers", {}).get("P642", []):
-                    need.add(_qid(q))
+        for pid, c in _kept_statements(e):
+            need.add(pid)
+            need.add(_qid(c["mainsnak"]))  # None for coordinates, dropped below
+        for c in _claims(e, "P31"):
+            need.update(_qid(q) for q in c.get("qualifiers", {}).get("P642", []))
+        need.update(_parents(e, "P279"))
     for t in types.values():
-        for pid in ("P31", "P279"):
-            need.update(_qid(c["mainsnak"]) for c in _claims(t, pid))
+        need.update(_parents(t, "P31") + _parents(t, "P279"))
     _ensure_labels(need - {None})
 
     out = {}
     for qid, e in ents.items():
-        rec = {"label": e.get("labels", {}).get("en", {}).get("value", qid),
-               "description": e.get("descriptions", {}).get("en", {}).get("value", ""),
+        rec = {"label": _en(e.get("labels", {}).get("en")) or qid,
+               "description": _en(e.get("descriptions", {}).get("en")) or "",
                "qids": [], "entity_set": [], "raw_bindings": []}
         entity_set = set()
         for c in _claims(e, "P31"):
@@ -159,29 +186,27 @@ def fetch_entities(qids):
                 entity_set.add(_labels[pq] if pq else _labels[tq])
         rec["entity_set"] = list(entity_set)
 
-        rec["aliases"] = [a["value"] for a in e.get("aliases", {}).get("en", [])]
-        rec["subclass_of"] = [_ref(q) for q in (_qid(c["mainsnak"]) for c in _claims(e, "P279")) if q]
+        rec["aliases"] = [v for v in (_en(a) for a in e.get("aliases", {}).get("en", [])) if v]
+        rec["subclass_of"] = [_ref(q) for q in _parents(e, "P279")]
         rec["wikipedia_title"] = e.get("sitelinks", {}).get("enwiki", {}).get("title", "")
 
         stm = []
-        for pid, cl in e.get("claims", {}).items():
-            for c in cl:
-                v = _qid(c["mainsnak"])
-                dv = c["mainsnak"].get("datavalue")
-                if v:
-                    stm.append({"pid": pid, "property": _labels[pid], "qid": v, "value": _labels[v]})
-                elif dv and dv.get("type") == "globecoordinate":
-                    stm.append({"pid": pid, "property": _labels[pid],
-                                "value": f"{dv['value']['latitude']:.5f}, {dv['value']['longitude']:.5f}"})
-        rec["statements"] = stm[:MAX_STATEMENTS]
+        for pid, c in _kept_statements(e):
+            v, dv = _qid(c["mainsnak"]), c["mainsnak"]["datavalue"]
+            if v:
+                stm.append({"pid": pid, "property": _labels[pid], "qid": v, "value": _labels[v]})
+            else:
+                stm.append({"pid": pid, "property": _labels[pid],
+                            "value": f"{dv['value']['latitude']:.5f}, {dv['value']['longitude']:.5f}"})
+        rec["statements"] = stm
 
         rec["type_hierarchy"] = {}
         for tq in dict.fromkeys(b["type_qid"] for b in rec["raw_bindings"]):
             t = types.get(tq, {})
             rec["type_hierarchy"][tq] = {
                 "label": _labels[tq],
-                "instance_of": [_ref(q) for q in (_qid(c["mainsnak"]) for c in _claims(t, "P31")) if q],
-                "subclass_of": [_ref(q) for q in (_qid(c["mainsnak"]) for c in _claims(t, "P279")) if q],
+                "instance_of": [_ref(q) for q in _parents(t, "P31")],
+                "subclass_of": [_ref(q) for q in _parents(t, "P279")],
             }
         out[qid] = rec
     return out

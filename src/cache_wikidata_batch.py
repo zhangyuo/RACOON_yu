@@ -39,8 +39,9 @@ def main():
     cache = json.load(open(CACHE, encoding="utf-8")) if CACHE.exists() else {}
     cache.setdefault("entity_full", {})
     cache.setdefault("relation", {})
-    full = cache["entity_full"]
-    todo = [q for q in qids if q not in full or "type_hierarchy" not in full[q]]  # old SPARQL entries lack the new fields
+    cache.setdefault("missing", [])  # QIDs that do not exist on Wikidata (deleted); remembered so they are not asked again
+    full, gone = cache["entity_full"], set(cache["missing"])
+    todo = [q for q in qids if (q not in full or "type_hierarchy" not in full[q]) and q not in gone]  # old SPARQL entries lack the new fields
     print(f"{len(qids)} QIDs in the list, {len(qids) - len(todo)} already cached, {len(todo)} to fetch", flush=True)
 
     t0, missing = time.time(), []
@@ -49,6 +50,7 @@ def main():
         recs = fetch_entities(chunk)
         full.update(recs)
         missing += [q for q in chunk if q not in recs]
+        cache["missing"] = sorted(gone | set(missing))
         save(cache)
         print(f"{min(i + CHUNK, len(todo))}/{len(todo)} fetched, {len(missing)} not found, {time.time() - t0:.0f}s", flush=True)
     if missing:
