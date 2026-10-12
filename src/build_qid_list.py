@@ -6,10 +6,11 @@ write every distinct Wikidata QID that was linked to qid_list.json (next to this
 Format: {qid: [table_id, col_idx, cell_text]}  (one example mention per QID)
 
 The scan feeds ReFinED exactly what RACOON_CTA.py feeds it: the first 10 rows of a table, linked column by column.
-  * SC / DB  : RAG4CTA's data loader (data/GitTablesSC, data/GitTablesDB, all splits).
+  * SC / DB  : the source fold files data/GitTablesSC/sp_semi1_cv_{0..4}.csv and data/GitTablesDB/db_semi1_cv_{0..4}.csv,
+               cells split on ';' (all folds, no train/valid/test split).
   * TURL     : the original *.table_col_type.json parsed with RACOON's own parse_example
-               (data/WikiTables-TURL-CTA/{test,dev,train}.table_col_type.json). The converted CSVs are not used,
-               they split multi-word cells.
+               (data/WikiTables-TURL-CTA/{test,dev,train}.table_col_type.json).
+  The converted train/valid/test CSVs are not used: they split multi-word cells into words.
 
 Units are scanned in this order: sc, db, turl_test, turl_dev, turl_train. qid_list.json is saved after every unit
 (and every 20000 tables inside a unit); finished units are recorded in qid_list.progress.json, so a re-run resumes.
@@ -20,6 +21,7 @@ Env vars:
 Usage:  python -u build_qid_list.py [--units sc,db,turl_test,turl_dev,turl_train] [--max_tables N]
 """
 import argparse
+import csv
 import json
 import os
 import sys
@@ -64,17 +66,20 @@ def scan_table(table_id, rows, all_qids):
                 all_qids.setdefault(qid, [table_id, col_idx, table_cols[col_idx][cell_idx]])
 
 
-def gittables_tables(subdir):
-    """(table_id, rows) for every table across train+valid+test of a GitTables dataset."""
-    sys.path.insert(0, str(RAG4CTA_ROOT))
-    from src.data_loader import _load_data_format
+def gittables_tables(subdir, prefix):
+    """(table_id, rows) for every table of a GitTables dataset, read from the source fold files
+    data/<subdir>/<prefix>_semi1_cv_{0..4}.csv (columns table_id, col_idx, class, class_id, data;
+    the cells of a column are separated by ';'). No train/valid/test split, no re-conversion."""
+    csv.field_size_limit(sys.maxsize)
     by_table: dict = {}
-    for split in ["train", "valid", "test"]:
-        for r in _load_data_format(RAG4CTA_ROOT / "data", subdir, split):
-            by_table.setdefault(r["table_id"], {}).setdefault(r["col_id"], r["sample_cells"])
+    for i in range(5):
+        with open(RAG4CTA_ROOT / "data" / subdir / f"{prefix}_semi1_cv_{i}.csv", newline="", encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+                cells = (r["data"] or "").split(";")
+                by_table.setdefault(r["table_id"], {}).setdefault(int(r["col_idx"]), cells)
     for tid, cols in by_table.items():
-        columns = [cols[c] for c in sorted(cols)]
-        n_rows = max(1, min(MAX_ROWS, max((len(c) for c in columns), default=0)))
+        columns = [cols[c][:MAX_ROWS] for c in sorted(cols)]
+        n_rows = max(1, max((len(c) for c in columns), default=0))
         yield tid, [[(columns[c][r] if r < len(columns[c]) else "") for c in range(len(columns))] for r in range(n_rows)]
 
 
@@ -109,7 +114,7 @@ def main():
         if unit in TURL_FILES:
             tables = turl_tables(TURL_FILES[unit])
         else:
-            tables = gittables_tables({"sc": "GitTablesSC", "db": "GitTablesDB"}[unit])
+            tables = gittables_tables(*{"sc": ("GitTablesSC", "sp"), "db": ("GitTablesDB", "db")}[unit])
         t0, n = time.time(), 0
         for table_id, rows in tables:
             scan_table(table_id, rows, all_qids)
