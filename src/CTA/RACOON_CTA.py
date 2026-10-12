@@ -1,29 +1,41 @@
 import os
+import sys
 import csv
 import json
 from random import seed
 from tqdm import tqdm
 from pathlib import Path
-data_path = Path(__file__).parent.parent / 'data'
+# RAG4CTA fix: `.resolve()` is required -- when run as `python RACOON_CTA.py`
+# (not an absolute path), `__file__` is relative, and pathlib's `.parent` on a
+# bare relative name doesn't climb real directory levels, so `data_path`
+# silently ended up wrong (pointing at ./data next to the script, not ../data).
+data_path = Path(__file__).resolve().parent.parent / 'data'
 sys.path.append(str(data_path))
 from TURL_CTA_label_reduction import reduced_label_set
-import os
 import openai
 import re
 import argparse
 
 seed(0)
-openai.api_key = os.getenv("OPENAI_API_KEY")
+# NOTE(RAG4CTA): the actual model client now lives in utils.response(), pointed
+# at our vLLM server -- this file no longer talks to the OpenAI API directly.
 
 from refined.inference.processor import Refined
-import sys
 sys.path.append('..')
 from KG_Linker import get_column_wise_spans
 from pruning import *
 from utils import *
 
+# RAG4CTA adaptation: reuse RAG4CTA's own SC/GitTablesDB loaders instead of
+# RACOON's TURL-only test.table_col_type.json + parse_example. See
+# sc_db_loader.py's docstring for exactly what is and isn't reused.
+sys.path.append('/nfs/srv/data2/af62lp@cs.aau.dk/RAG4CTA/scripts/racoon_adapter')
+from sc_db_loader import load_tables as load_sc_db_tables
+
+# RAG4CTA fix: see utils.py -- same data_dir override, home filesystem is nearly full.
 refined = Refined.from_pretrained(model_name='wikipedia_model',
-                                  entity_set="wikidata")
+                                  entity_set="wikidata",
+                                  data_dir="/nfs/srv/data2/af62lp@cs.aau.dk/refined_cache")
 preprocessor = refined.preprocessor
 
 def get_info_re(column):
@@ -61,31 +73,75 @@ def main():
     
     parser = argparse.ArgumentParser(description='Column Type Annotation with RACOON+')
     parser.add_argument('--model', type=str, default='gpt-4o-mini',
-                        help='OpenAI model to use (default: gpt-4o-mini)')
+                        help='OpenAI model to use (default: gpt-4o-mini; ignored for GLM, see utils.response)')
+    parser.add_argument('--dataset', type=str, default='turl',
+                        choices=['turl', 'sc', 'db'],
+                        help='Dataset: turl (original) or sc/db (RAG4CTA GitTablesSC/DB, via sc_db_loader)')
     parser.add_argument('--context', type=str, default='col',
                         choices=['wikiAPI', 'cell', 'table', 'col', 'hybrid'],
                         help='Context type (default: hybrid)')
     parser.add_argument('--info', type=str, default='type',
                         choices=['entity', 'des', 'type', 'relation'],
                         help='Information type (default: type)')
+    parser.add_argument('--max_tables', type=int, default=None,
+                        help='RAG4CTA addition: cap the number of tables processed, for smoke tests')
 
     args = parser.parse_args()
 
     data_dir = os.path.join(os.getenv('DATA_DIR', '.'), 'data')
     model = args.model
+    dataset = args.dataset
     context = args.context
     info = args.info
 
-    OUTPUT = f"{model}/RACOON_{context}_{info}.csv"
+    if dataset != 'turl' and context == 'wikiAPI':
+        raise NotImplementedError("wikiAPI context needs `colset`, which sc_db_loader does not build; "
+                                   "use --context col/cell/table/hybrid for sc/db")
+
+    # RAG4CTA fix (two issues):
+    # 1. `--model` (default 'gpt-4o-mini') is a leftover OpenAI-era argument
+    #    that no longer controls which model actually runs -- utils.response()
+    #    always calls VLLM_MODEL -- so naming the output folder after it was
+    #    actively misleading (results labelled "gpt-4o-mini" that were really
+    #    GLM). Name the folder after the model that is actually running instead.
+    # 2. Outputs were landing inside src/ (a source directory) because OUTPUT
+    #    was a path relative to cwd. Write to <RACOON repo root>/outputs/ instead.
+    model_label = os.environ.get('VLLM_MODEL', 'zai-org/GLM-4-9B-0414').replace('/', '-')
+    racoon_root = Path(__file__).resolve().parent.parent.parent
+    OUTPUT = str(racoon_root / 'outputs' / model_label /
+                 (f"RACOON_{context}_{info}.csv" if dataset == 'turl'
+                  else f"{dataset}/RACOON_{context}_{info}.csv"))
     os.makedirs(os.path.dirname(OUTPUT), exist_ok=True)
 
     res_format = "{'type': []}"
 
-    with open(os.path.join(data_dir, 'test.table_col_type.json'), 'r') as f:
-        examples = json.load(f)
+    if dataset == 'turl':
+        label_set = reduced_label_set
+        # RAG4CTA fix: `data_dir` (os.getenv('DATA_DIR', '.') + 'data') is
+        # relative to whatever cwd the script happens to be launched from --
+        # same class of bug as the module-level `data_path` fixed above with
+        # .resolve(). Use that already-correct absolute path instead.
+        with open(data_path / 'test.table_col_type.json', 'r') as f:
+            examples = json.load(f)
+    else:
+        examples, label_set = load_sc_db_tables(dataset)
+        # RAG4CTA addition: skip tables that contain no evaluable column at
+        # all (gold_type == '-1' for every column) -- they cost calls but can
+        # never contribute to Micro/Macro F1.
+        examples = [t for t in examples if any(g != '-1' for g in t['gold_types'])]
+    if args.max_tables is not None:
+        examples = examples[:args.max_tables]
 
     for id, example in enumerate(tqdm(examples)):
-        table_raw, table_with_en, label, headers, meta_data, num_col, max_num_row, colset = parse_example(example)
+        if dataset == 'turl':
+            table_raw, table_with_en, label, headers, meta_data, num_col, max_num_row, colset = parse_example(example)
+            targets = list(range(num_col))
+        else:
+            table_raw, num_col, colset = example['table_raw'], example['num_col'], None
+            # RAG4CTA addition: only ask the model about columns that are
+            # actually scored; the rest of the table is still full context
+            # (CSV_like below still uses all num_col columns).
+            targets = [i for i in range(num_col) if example['gold_types'][i] != '-1']
         x = min(len(table_raw),10)
         y = len(table_raw[0])
         table = []
@@ -128,8 +184,8 @@ def main():
             pruned_table_hint = pruning_orig(CSV_like, orig_table_hint)
             pattern = r"-?\s*Column \d+:(.*?)(?:\n|$)"
             hint_strings = re.findall(pattern, pruned_table_hint)
-            hint = f"The entity labels in the Wikidata knowledge graph corresponding to the cells in this column are provided as a list: {hint_strings[0]}."
-        
+            hint = f"The entity labels in the Wikidata knowledge graph corresponding to the cells in this column are provided as a list: {hint_strings[targets[0]]}."
+
         elif info == "type":
             types,_ = get_types(EL_result_table)
             orig_types = []
@@ -140,7 +196,10 @@ def main():
             pattern = r"-?\s*Column \d+:(.*?)(?:\n|$)"
             dict_strings = re.findall(pattern, pruned_hint)
             hint_list = [safe_parse_dict(d) for d in dict_strings]
-            hint = serialize_dict(hint_list[0])
+            # RAG4CTA: the first message may target any column in `targets`, not
+            # always column 0 -- same length-guard the follow-up loop uses below.
+            hint = (serialize_dict(hint_list[targets[0]]) if targets[0] < len(hint_list)
+                    else "Entities in this column are instances of the following wikidata entities: ")
 
         elif info == "des":
             table_entities = get_entity_label_des(EL_result_table)
@@ -151,7 +210,7 @@ def main():
             pruned_table_hint = pruning_orig(CSV_like, orig_table_hint)
             pattern = r"-?\s*Column \d+:(.*?)(?:\n|$)"
             hint_strings = re.findall(pattern, pruned_table_hint)
-            hint = f"The entity labels with descriptions in the Wikidata knowledge graph corresponding to the cells in this column are provided as a list: {hint_strings[0]}."
+            hint = f"The entity labels with descriptions in the Wikidata knowledge graph corresponding to the cells in this column are provided as a list: {hint_strings[targets[0]]}."
         
         elif info == "relation":
             table_relations = get_entity_relation(EL_result_table)
@@ -178,9 +237,9 @@ def main():
                 "role": "user",
                 "content": f"""Consider this table with {num_col} columns given in Comma-separated Values format:
                         {CSV_like}
-                        There are a list of 126 valid types for each column: {reduced_label_set}. Your task is to choose only one type from the list to annotate Column {1}. 
+                        There are a list of {len(label_set)} valid types for each column: {label_set}. Your task is to choose only one type from the list to annotate Column {targets[0]+1}.
             Solve this task by following these steps:
-            1. **Analyze the data in Column {1} in the context of the entire table**
+            1. **Analyze the data in Column {targets[0]+1} in the context of the entire table**
             2. **Evaluate the Wikidata hint if not empty: {hint}**:
             - Use the hint to enhance your understanding of the column data.
             3. **Select the best type** from the given label set. 
@@ -199,18 +258,21 @@ def main():
         prediction = chatgpt_msg.content
         predicted_type = parse_pred(prediction)
         messages.append(dict(chatgpt_msg))
+        col_prompt_tok, col_completion_tok = last_usage["prompt_tokens"], last_usage["completion_tokens"]
 
-        if predicted_type not in reduced_label_set:
+        if predicted_type not in label_set:
             messages.append({"role": "user",
                 "content": f"""Your prediction {predicted_type} is not in the given label set. Please try again to choose the closest label in the given set to annotate the first column. Choose only one valid type from the given list of types. Check that the type MUST MUST MUST be in the list. Give the answer in valid JSON format. DO NOT include any explanation or additional text."""})
             chatgpt_msg = response(messages, model)
             prediction = chatgpt_msg.content
             messages.append(dict(chatgpt_msg))
             predicted_type = parse_json_pred(prediction)
-                
-        all_preds.append((predicted_type, prediction))
+            col_prompt_tok += last_usage["prompt_tokens"]
+            col_completion_tok += last_usage["completion_tokens"]
 
-        for i in range(1, num_col):
+        all_preds.append((predicted_type, prediction, col_prompt_tok, col_completion_tok))
+
+        for i in targets[1:]:  # RAG4CTA: only the remaining evaluable columns
 
             if info == "type":
                 if i >= len(hint_list): hint = "Entities in this column are instances of the following wikidata entities: "
@@ -243,21 +305,36 @@ def main():
             prediction = chatgpt_msg.content
             predicted_type = parse_pred(prediction)
             messages.append(dict(chatgpt_msg))
+            col_prompt_tok, col_completion_tok = last_usage["prompt_tokens"], last_usage["completion_tokens"]
 
-            if predicted_type not in reduced_label_set:
+            if predicted_type not in label_set:
                 messages.append({"role": "user",
                     "content": f"""Your prediction {predicted_type} is not in the given label set. Please try again to choose the closest label in the given set to annotate the first column. Choose only one valid type from the given list of types. Check that the type MUST MUST MUST be in the list. Give the answer in valid JSON format. DO NOT include any explanation or additional text."""})
                 chatgpt_msg = response(messages, model)
                 pred = chatgpt_msg.content
                 messages.append(dict(chatgpt_msg))
                 predicted_type = parse_json_pred(pred)
-                    
-            all_preds.append((predicted_type, prediction))
+                col_prompt_tok += last_usage["prompt_tokens"]
+                col_completion_tok += last_usage["completion_tokens"]
+
+            all_preds.append((predicted_type, prediction, col_prompt_tok, col_completion_tok))
 
         with open(OUTPUT, "a", newline="", encoding="UTF-8") as output:
             writer = csv.writer(output)
-            for i, p in enumerate(all_preds):
-                writer.writerow([id, i, p[0], hints[i], p[1]])
+            # `all_preds`/`hints` are in the order of `targets`, not 0..num_col-1
+            # (for sc/db, non-evaluable columns were skipped entirely).
+            for pos, (col_idx, p) in enumerate(zip(targets, all_preds)):
+                if dataset == 'turl':
+                    writer.writerow([id, pos, p[0], hints[pos], p[1], p[2], p[3]])
+                else:
+                    # RAG4CTA addition: carry table_id/col_id/gold_type, and
+                    # prompt/completion token counts (p[2]/p[3], read straight
+                    # off the vLLM response's own `usage` field -- see
+                    # utils.response()/last_usage), so the output is
+                    # self-contained for src/eval/metrics.py and cost analysis,
+                    # no separate id-join file needed.
+                    writer.writerow([id, pos, p[0], hints[pos], p[1], p[2], p[3],
+                                      example['table_id'], example['col_ids'][col_idx], example['gold_types'][col_idx]])
 
 if __name__ == "__main__":
     main()

@@ -4,7 +4,8 @@ import argparse
 import sys
 import os
 from pathlib import Path
-data_path = Path(__file__).parent.parent / 'data'
+# RAG4CTA fix: same missing-.resolve() relative-path bug as RACOON_CTA.py
+data_path = Path(__file__).resolve().parent.parent / 'data'
 sys.path.append(str(data_path))
 sys.path.append('..')
 from TURL_CTA_label_reduction import reduced_label_set
@@ -13,9 +14,9 @@ from utils import f1_score_multilabel
 types = reduced_label_set
 
 
-data_dir = os.path.join(os.getenv('DATA_DIR', '.'), 'data')
+# RAG4CTA fix: same relative-path issue as above -- use the already-resolved data_path
 labels = []
-with open(os.path.join(data_dir, 'CTA_remapped_test_labels.txt'), 'r') as file:
+with open(data_path / 'CTA_remapped_test_labels.txt', 'r') as file:
     labels = file.readlines()
 labels = [line.strip() for line in labels]
 

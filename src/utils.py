@@ -13,10 +13,64 @@ import re
 from collections import defaultdict, Counter
 data_dir = os.getenv('DATA_DIR', './data')
 
+# RAG4CTA addition: Wikidata's public SPARQL endpoint (query.wikidata.org) currently
+# rate-limits to 1 req/min during an active WDQS outage, so every live query below
+# mostly fails -- cache every *successful* lookup on disk, in ONE shared file with
+# a section per query shape, so nothing already-successful is ever re-queried
+# (failures are not cached, since they may succeed once the outage clears).
+# "entity_full" merges what used to be get_instance_of's and get_entity_info's
+# separate queries (both take a single QID) into one combined query/cache entry --
+# see _fetch_entity_full(). "relation" stays separate since it takes a QID *pair*.
+_CACHE_DIR = os.path.dirname(os.path.abspath(__file__))
+_WIKIDATA_CACHE_PATH = os.path.join(_CACHE_DIR, "wikidata_cache.json")
+
+def _load_wikidata_cache():
+    if os.path.exists(_WIKIDATA_CACHE_PATH):
+        try:
+            with open(_WIKIDATA_CACHE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            data = {}
+    else:
+        data = {}
+    # Back-compat: migrate the older split "instance_of"/"entity_info" sections
+    # (from before the two queries were merged) into "entity_full" if present.
+    if "instance_of" in data or "entity_info" in data:
+        merged = data.setdefault("entity_full", {})
+        for qid, v in data.pop("instance_of", {}).items():
+            merged.setdefault(qid, {}).update({
+                "qids": v["qids"], "entity_set": v["entity_set"],
+                "raw_bindings": v["raw_bindings"],
+                "label": merged.get(qid, {}).get("label", ""),
+                "description": merged.get(qid, {}).get("description", ""),
+            })
+        for qid, v in data.pop("entity_info", {}).items():
+            merged.setdefault(qid, {}).update(v)
+        with open(_WIKIDATA_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)  # persist the migration immediately
+    data.setdefault("entity_full", {})  # get_instance_of() + get_entity_info() -- entity/type/des modes
+    data.setdefault("relation", {})     # get_relation_single_direction()      -- relation mode
+    return data
+
+_wikidata_cache = _load_wikidata_cache()
+_entity_full_cache = _wikidata_cache["entity_full"]   # kept as a local alias, same dict object
+_relation_cache = _wikidata_cache["relation"]         # kept as a local alias, same dict object
+
+def _save_wikidata_cache():
+    with open(_WIKIDATA_CACHE_PATH, "w", encoding="utf-8") as f:
+        json.dump(_wikidata_cache, f, ensure_ascii=False)
+
+# kept as a thin alias so call sites below don't need to change name
+_save_entity_full_cache = _save_wikidata_cache
+_save_relation_cache = _save_wikidata_cache
+
 from refined.inference.processor import Refined
 
+# RAG4CTA fix: default cache dir (~/.cache/refined) is on a nearly-full home
+# filesystem; point at the NFS drive instead (see also KG_Linker.py, CTA/RACOON_CTA.py).
 refined = Refined.from_pretrained(model_name='wikipedia_model',
-                                  entity_set="wikidata")
+                                  entity_set="wikidata",
+                                  data_dir="/nfs/srv/data2/af62lp@cs.aau.dk/refined_cache")
 preprocessor = refined.preprocessor
 
 def parse_example(example):
@@ -65,117 +119,187 @@ def parse_example(example):
     return table, table_with_en, label, headers, meta_data, num_col, max_num_row, colset
 
 
-def response(messages, model):
-    completion = openai.chat.completions.create(
-        model=model,
-        messages=messages
-    )
-    return completion.choices[0].message
+# RAG4CTA adaptation: point at our self-hosted vLLM server (OpenAI-compatible
+# endpoint) instead of the official OpenAI API. `model` argument is kept for
+# call-site compatibility but ignored -- the vLLM server only serves one model.
+_vllm_client = openai.OpenAI(
+    api_key=os.environ["VLLM_API_KEY"],
+    base_url=os.environ.get("VLLM_BASE_URL", "http://130.225.39.64:8000/v1"),
+)
+_VLLM_MODEL = os.environ.get("VLLM_MODEL", "zai-org/GLM-4-9B-0414")
 
-def get_instance_of(qid):
+
+# RAG4CTA addition: after each response() call, this dict (mutated in place,
+# so `from utils import *` star-imports still see updates) holds
+# {"prompt_tokens", "completion_tokens"} for that call, read straight from the
+# vLLM server's own OpenAI-compatible response -- no re-tokenizing/estimating.
+# Kept as a side channel (not a second return value) so NoHint_baseline.py /
+# SelfHint_baseline.py / RACOON_RE.py, which also call response() and expect a
+# single return value, keep working unchanged.
+last_usage = {"prompt_tokens": 0, "completion_tokens": 0}
+
+
+def response(messages, model):
+    # RAG4CTA fix: was calling with no temperature/seed at all, so every call
+    # sampled with vLLM's server default and no fixed seed -- two runs of
+    # identical code on identical data gave different F1 (measured: SC .4347
+    # vs .4133). Fix temperature=0 and seed=42 (matching RAG4CTA's own
+    # LLM4CTA baseline, src/llm/adapter.py's default config) so a
+    # RACOON-vs-LLM4CTA comparison isn't also secretly a
+    # determinism-vs-randomness comparison.
+    #
+    # RAG4CTA fix: RACOON keeps one growing conversation across every column
+    # of a table, and each turn's reply gets appended to the next turn's
+    # prompt. Measured on a real TURL table: completion length grows turn
+    # over turn (183 -> 228 -> 345 -> 488 tokens) with no ceiling, and a
+    # table with enough columns eventually produces a single call slow
+    # enough to exceed the client's timeout (openai.APITimeoutError,
+    # reproduced twice on the TURL smoke test). max_tokens=2000 is generous
+    # (SC/DB's own completions average ~135 tokens) but stops the runaway
+    # case; the retry loop below covers any timeout that still slips through.
+    for attempt in range(3):
+        try:
+            completion = _vllm_client.chat.completions.create(
+                model=_VLLM_MODEL,
+                messages=messages,
+                temperature=0,
+                seed=42,
+                max_tokens=2000,
+            )
+            break
+        except openai.APITimeoutError:
+            if attempt == 2:
+                raise
+            print(f"[utils.response] timeout, retrying ({attempt + 1}/3)", flush=True)
+    msg = completion.choices[0].message
+    # RAG4CTA fix: this GLM/vLLM deployment sometimes puts the actual reply in
+    # `reasoning` and leaves `content` empty (see RAG4CTA's own
+    # scripts/exp_tree_descent.py, which has the same fallback). RACOON_CTA.py
+    # only ever reads `.content`, so backfill it here, once, in one place.
+    if not msg.content:
+        msg.content = getattr(msg, "reasoning", None) or ""
+    if completion.usage:
+        last_usage["prompt_tokens"] = completion.usage.prompt_tokens
+        last_usage["completion_tokens"] = completion.usage.completion_tokens
+    else:
+        last_usage["prompt_tokens"] = 0
+        last_usage["completion_tokens"] = 0
+    return msg
+
+def _fetch_entity_full(qid):
     """
-    Retrieve entity types (P31: instance of) for a given Wikidata QID.
-    
-    Queries Wikidata to find what types/classes an entity belongs to, with support
-    for qualified statements (P642: of). For example, if an entity is "instance of: 
-    position" with qualifier "of: basketball", returns the qualifier object instead.
-    
-    Args:
-        qid: Wikidata identifier
-    
-    Returns:
-        qids: List of type QIDs found for this entity
-        entity_set: Set of human-readable labels for the types
+    RAG4CTA: merged version of what used to be two separate live queries
+    (get_instance_of's P31 "instance of" lookup and get_entity_info's
+    label+description lookup) -- both only need a single QID, so they are
+    combined into ONE SPARQL request per QID, halving the number of live
+    calls against Wikidata's rate-limited endpoint. get_relation_single_direction
+    is NOT folded in here: it takes a *pair* of QIDs, a different query shape.
+
+    Returns a dict (and caches it under _entity_full_cache[qid]) with:
+        label, description       -- from get_entity_info's old query
+        qids, entity_set, raw_bindings  -- from get_instance_of's old query
+    or None on failure (not cached, so a later call can retry).
     """
+    if qid in _entity_full_cache:
+        return _entity_full_cache[qid]
 
     sparql = SPARQLWrapper("http://query.wikidata.org/sparql")
-    sparql.setQuery(f"""SELECT ?type ?typeLabel ?pq_obj ?pq_objLabel 
+    sparql.setQuery(f"""SELECT ?itemLabel ?itemDescription ?type ?typeLabel ?pq_obj ?pq_objLabel
        WHERE {{
-       wd:{qid} p:P31 ?statementNode.
-       ?statementNode ps:P31 ?type.
+       BIND(wd:{qid} AS ?item)
        OPTIONAL {{
-          ?statementNode pq:P642 ?pq_obj.
+           wd:{qid} p:P31 ?statementNode.
+           ?statementNode ps:P31 ?type.
+           OPTIONAL {{
+              ?statementNode pq:P642 ?pq_obj.
+           }}
        }}
        SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
        }}
        """)
     sparql.setReturnFormat(JSON)
-    qids = []
-    entity_set = set()
 
     try:
         ret = sparql.query()
-        results = ret.convert()
-        data = results["results"]["bindings"]
-    except:
-        return qids, entity_set
+        data = ret.convert()["results"]["bindings"]
+    except Exception:
+        return None
 
+    if not data:
+        return None
+
+    label = data[0].get("itemLabel", {}).get("value", "")
+    description = data[0].get("itemDescription", {}).get("value", "")
+
+    qids, entity_set, raw_bindings = [], set(), []
     for binding in data:
-        # Prefer qualifier object (P642) if present, otherwise use the main type
-        if 'pq_obj' in binding:
-            qid = binding['pq_obj']['value'].split('/')[-1]
-            label = binding['pq_objLabel']['value']
+        if "type" not in binding:
+            continue  # the OPTIONAL P31 block matched nothing for this row
+        entry = {
+            "type_qid": binding["type"]["value"].split("/")[-1],
+            "type_label": binding["typeLabel"]["value"],
+        }
+        if "pq_obj" in binding:
+            entry["pq_obj_qid"] = binding["pq_obj"]["value"].split("/")[-1]
+            entry["pq_obj_label"] = binding["pq_objLabel"]["value"]
+        raw_bindings.append(entry)
+        if "pq_obj" in binding:
+            qids.append(entry["pq_obj_qid"]); entity_set.add(entry["pq_obj_label"])
         else:
-            qid = binding['type']['value'].split('/')[-1]
-            label = binding['typeLabel']['value']
-        qids.append(qid)
-        entity_set.add(label)
-    
-    return qids, entity_set
+            qids.append(entry["type_qid"]); entity_set.add(entry["type_label"])
+
+    result = {
+        "label": label,
+        "description": description,
+        "qids": qids,
+        "entity_set": list(entity_set),
+        "raw_bindings": raw_bindings,
+    }
+    _entity_full_cache[qid] = result
+    _save_entity_full_cache()
+    return result
+
+def get_instance_of(qid):
+    """
+    Retrieve entity types (P31: instance of) for a given Wikidata QID.
+    Backed by the merged _fetch_entity_full() query/cache (see its docstring).
+
+    Returns:
+        qids: List of type QIDs found for this entity
+        entity_set: Set of human-readable labels for the types
+    """
+    result = _fetch_entity_full(qid)
+    if result is None:
+        return [], set()
+    return result["qids"], set(result["entity_set"])
 
 def get_entity_info(qid):
     """
     Retrieve the label and description for a Wikidata entity.
-    
-    Queries the Wikidata SPARQL endpoint to fetch human-readable information
-    about an entity given its QID (Wikidata identifier).
-    
-    Args:
-        qid: Wikidata identifier 
-    
-    Returns:
-        dict: A dictionary containing:
-            - 'label': The entity's English label/name
-            - 'description': The entity's English description (empty string if unavailable)
-        None: If the query fails or the entity is not found
-    
-    """
+    Backed by the merged _fetch_entity_full() query/cache (see its docstring).
 
-    query = f"""
-    SELECT ?itemLabel ?itemDescription
-    WHERE {{
-      BIND(wd:{qid} AS ?item)
-      SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
-    }}
+    Returns:
+        dict: {'label': ..., 'description': ...}
+        None: if the query fails or the entity is not found
     """
-    
-    endpoint_url = "https://query.wikidata.org/sparql"
-    sparql = SPARQLWrapper(endpoint_url)
-    sparql.setQuery(query)
-    sparql.setReturnFormat(JSON)
-    
-    try:
-        results = sparql.query().convert()
-        bindings = results["results"]["bindings"][0]
-        
-        return {
-            "label": bindings["itemLabel"]["value"],
-            "description": bindings.get("itemDescription", {}).get("value", "")
-        }
-        
-    except Exception as e:
-        print(f"Error fetching data for {qid}: {str(e)}")
+    result = _fetch_entity_full(qid)
+    if result is None:
         return None
+    return {"label": result["label"], "description": result["description"]}
 
 def get_relation_single_direction(qid1, qid2):
+    cache_key = f"{qid1}|{qid2}"
+    if cache_key in _relation_cache:
+        return set(_relation_cache[cache_key]["rel_set"])
+
     sparql = SPARQLWrapper("http://query.wikidata.org/sparql")
     sparql.setQuery(f"""SELECT ?property ?propertyLabel WHERE {{
         VALUES (?entity1 ?entity2) {{(wd:{qid1} wd:{qid2})}}
-        
+
         {{
             ?entity1 ?property ?entity2.
         }}
-        
+
         ?propertyEntity wikibase:directClaim ?property.
         ?propertyEntity rdfs:label ?propertyLabel.
         FILTER(LANG(?propertyLabel) = "en")
@@ -183,6 +307,7 @@ def get_relation_single_direction(qid1, qid2):
         """)
     sparql.setReturnFormat(JSON)
     rel_set = set()
+    raw_bindings = []
     try :
         ret = sparql.query()
         results = ret.convert()
@@ -193,6 +318,17 @@ def get_relation_single_direction(qid1, qid2):
     for binding in data:
         label = binding['propertyLabel']['value']
         rel_set.add(label)
+        # RAG4CTA: `property` is the raw property URI used in the triple (e.g.
+        # .../prop/direct/P17) -- keep its QID-style suffix too, not just the
+        # label, so the cache preserves everything Wikidata actually returned.
+        raw_bindings.append({
+            "property_id": binding['property']['value'].split('/')[-1],
+            "property_label": label,
+        })
+
+    if rel_set:
+        _relation_cache[cache_key] = {"rel_set": list(rel_set), "raw_bindings": raw_bindings}
+        _save_relation_cache()
 
     return rel_set
     
