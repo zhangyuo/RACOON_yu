@@ -4,8 +4,10 @@ Fill wikidata_cache.json["entity_full"] for every QID in qid_list.json (and the 
 (see wikidata_api.py). QIDs that are already cached with the full record are skipped, so it can be re-run
 and resumed. utils.py reads the same file, so RACOON never has to query Wikidata live for these QIDs.
 
-Usage:  python -u cache_wikidata_batch.py
+Usage:  python -u cache_wikidata_batch.py [--tags baseline]
+--tags reads only qid_list.<tag>.json (comma separated); without it every qid_list*.json is used.
 """
+import argparse
 import json
 import os
 import sys
@@ -30,7 +32,10 @@ def save(cache):
 
 
 def main():
-    qids = list(load_all_qids())  # union of qid_list.json and the per-job qid_list.<tag>.json files
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--tags", default=None, help="comma separated run tags whose qid_list.<tag>.json to cache (default: all)")
+    args = ap.parse_args()
+    qids = list(load_all_qids(args.tags.split(",") if args.tags else None))
     cache = json.load(open(CACHE, encoding="utf-8")) if CACHE.exists() else {}
     cache.setdefault("entity_full", {})
     cache.setdefault("relation", {})

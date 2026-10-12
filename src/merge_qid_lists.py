@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 The QID scan can run as several parallel jobs, each writing qid_list.<tag>.json (see build_qid_list.py).
-load_all_qids() returns the union of qid_list.json and all qid_list.<tag>.json (progress and smoke-test files excluded).
+load_all_qids() returns the union of qid_list.json and all qid_list.<tag>.json (progress and smoke-test files excluded),
+or only of the given tags.
 
 Usage:  python merge_qid_lists.py     # writes the union to qid_list.json
 """
@@ -17,9 +18,11 @@ def result_files():
             if "progress" not in p.name and "smoke" not in p.name]
 
 
-def load_all_qids():
+def load_all_qids(tags=None):
+    """Union of the result files. tags=["baseline"] reads only qid_list.baseline.json; None reads every result file."""
     merged = {}
-    for p in result_files():
+    files = [SRC / f"qid_list.{t}.json" for t in tags] if tags else result_files()
+    for p in files:
         with open(p, encoding="utf-8") as f:
             for qid, example in json.load(f).items():
                 merged.setdefault(qid, example)
