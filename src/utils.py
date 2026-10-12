@@ -70,7 +70,7 @@ from refined.inference.processor import Refined
 # filesystem; point at the NFS drive instead (see also KG_Linker.py, CTA/RACOON_CTA.py).
 refined = Refined.from_pretrained(model_name='wikipedia_model',
                                   entity_set="wikidata",
-                                  data_dir="/nfs/srv/data2/af62lp@cs.aau.dk/refined_cache")
+                                  data_dir=os.getenv("REFINED_CACHE_DIR", "/nfs/srv/data2/af62lp@cs.aau.dk/refined_cache"))
 preprocessor = refined.preprocessor
 
 def parse_example(example):

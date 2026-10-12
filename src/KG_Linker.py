@@ -1,3 +1,4 @@
+import os
 import re
 from utils import compute_cell_boundaries
 from refined.inference.processor import Refined
@@ -5,7 +6,7 @@ from refined.inference.processor import Refined
 # RAG4CTA fix: see utils.py -- same data_dir override, home filesystem is nearly full.
 refined = Refined.from_pretrained(model_name='wikipedia_model',
                                   entity_set="wikidata",
-                                  data_dir="/nfs/srv/data2/af62lp@cs.aau.dk/refined_cache")
+                                  data_dir=os.getenv("REFINED_CACHE_DIR", "/nfs/srv/data2/af62lp@cs.aau.dk/refined_cache"))
 
 
 def _group_spans_by_cell(text, spans):

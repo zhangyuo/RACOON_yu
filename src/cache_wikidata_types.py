@@ -14,7 +14,7 @@ import json, time
 from pathlib import Path
 from SPARQLWrapper import SPARQLWrapper, JSON
 
-RACOON_SRC = Path("/nfs/srv/data2/af62lp@cs.aau.dk/cta_baselines/RAG/RACOON/src")
+RACOON_SRC = Path(__file__).resolve().parent
 QID_LIST_PATH = RACOON_SRC / "qid_list.json"  # written by the earlier ReFinED scan
 CACHE_PATH = RACOON_SRC / "wikidata_cache.json"
 SECTION = "entity_full"

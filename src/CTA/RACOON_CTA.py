@@ -29,13 +29,13 @@ from utils import *
 # RAG4CTA adaptation: reuse RAG4CTA's own SC/GitTablesDB loaders instead of
 # RACOON's TURL-only test.table_col_type.json + parse_example. See
 # sc_db_loader.py's docstring for exactly what is and isn't reused.
-sys.path.append('/nfs/srv/data2/af62lp@cs.aau.dk/RAG4CTA/scripts/racoon_adapter')
+sys.path.append(os.path.join(os.getenv('RAG4CTA_ROOT', '/nfs/srv/data2/af62lp@cs.aau.dk/RAG4CTA'), 'scripts/racoon_adapter'))
 from sc_db_loader import load_tables as load_sc_db_tables
 
 # RAG4CTA fix: see utils.py -- same data_dir override, home filesystem is nearly full.
 refined = Refined.from_pretrained(model_name='wikipedia_model',
                                   entity_set="wikidata",
-                                  data_dir="/nfs/srv/data2/af62lp@cs.aau.dk/refined_cache")
+                                  data_dir=os.getenv("REFINED_CACHE_DIR", "/nfs/srv/data2/af62lp@cs.aau.dk/refined_cache"))
 preprocessor = refined.preprocessor
 
 def get_info_re(column):
