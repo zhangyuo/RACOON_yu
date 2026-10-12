@@ -61,9 +61,12 @@ def scan_table(table_id, rows, all_qids):
     table_row = list(zip(*table_cols))
     spans = get_column_wise_spans("col", table_row, table_cols)
     for col_idx, col_qids in enumerate(process_EL_res(s) for s in spans):
+        col_cells = table_cols[col_idx] if col_idx < len(table_cols) else []
         for cell_idx, qid in enumerate(col_qids):
             if qid:
-                all_qids.setdefault(qid, [table_id, col_idx, table_cols[col_idx][cell_idx]])
+                # the linker groups mentions by splitting the column text on "||"; a cell that itself contains "||"
+                # shifts the groups, so the example cell text is only a hint (the QID is what matters)
+                all_qids.setdefault(qid, [table_id, col_idx, col_cells[cell_idx] if cell_idx < len(col_cells) else ""])
 
 
 def gittables_tables(subdir, prefix):
@@ -115,9 +118,14 @@ def main():
             tables = turl_tables(TURL_FILES[unit])
         else:
             tables = gittables_tables(*{"sc": ("GitTablesSC", "sp"), "db": ("GitTablesDB", "db")}[unit])
-        t0, n = time.time(), 0
+        t0, n, failed = time.time(), 0, []
         for table_id, rows in tables:
-            scan_table(table_id, rows, all_qids)
+            try:
+                scan_table(table_id, rows, all_qids)
+            except Exception as e:  # one odd table must not stop a run that takes hours
+                failed.append(table_id)
+                if len(failed) <= 5:
+                    print(f"[{unit}] skipped table {table_id}: {type(e).__name__}: {e}", flush=True)
             n += 1
             if n % 500 == 0:
                 print(f"[{unit}] {n} tables, {len(all_qids)} distinct QIDs, {time.time() - t0:.0f}s", flush=True)
@@ -127,7 +135,8 @@ def main():
                 break
         done.append(unit)
         save(all_qids, done)
-        print(f"[{unit}] done: {n} tables, {len(all_qids)} distinct QIDs so far, {time.time() - t0:.0f}s", flush=True)
+        print(f"[{unit}] done: {n} tables ({len(failed)} skipped after an error), {len(all_qids)} distinct QIDs so far, "
+              f"{time.time() - t0:.0f}s", flush=True)
 
     print(f"saved {len(all_qids)} distinct QIDs to {OUT}", flush=True)
 
