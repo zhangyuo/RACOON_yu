@@ -3,6 +3,7 @@
 # Run once on ai-fe02:  bash scripts/setup_racoon_env.sh
 # ReFinED downloads its model files into $REFINED_CACHE_DIR on first use (needs internet).
 set -e
+source "${CONDA_SH:-$HOME/anaconda3/etc/profile.d/conda.sh}"  # make `conda` available in non-interactive SLURM shells
 ENV_NAME=${ENV_NAME:-racoon}
 conda create -y -n "$ENV_NAME" python=3.8
 PIP="$(conda run -n "$ENV_NAME" which pip)"
