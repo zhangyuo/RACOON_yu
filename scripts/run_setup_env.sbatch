@@ -5,7 +5,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --time=01:30:00
-#SBATCH --output=log/setup_env_%j.out
+#SBATCH --output=log/setup_env.out
 
 set -e
 echo "host=$(hostname) date=$(date)"

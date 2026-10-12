@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=32G
 #SBATCH --time=02:00:00
-#SBATCH --output=log/download_turl_%j.out
+#SBATCH --output=log/download_turl.out
 
 set -e
 RAG4CTA_ROOT=${RAG4CTA_ROOT:-$HOME/RAG4CTA}
