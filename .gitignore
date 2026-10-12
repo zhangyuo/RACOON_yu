@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+
+# SLURM / run logs
+log/
+*.log
+
+# secrets
+.env
+
+# smoke-test outputs of build_qid_list.py (the real qid_list.json and wikidata_cache.json ARE tracked)
+src/qid_list.smoke*.json
