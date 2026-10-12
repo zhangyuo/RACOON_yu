@@ -28,5 +28,5 @@ for f in "$REFINED_CACHE_DIR"/wikipedia_model/*.np "$REFINED_CACHE_DIR"/wikidata
 done
 wait
 echo "page cache warm-up: $(( $(date +%s) - t0 ))s"
-$PY -u src/build_qid_list.py ${UNITS:+--units $UNITS} ${MAX_TABLES:+--max_tables $MAX_TABLES}
+$PY -u src/build_qid_list.py ${UNITS:+--units $UNITS} ${MAX_TABLES:+--max_tables $MAX_TABLES} ${SHARD:+--shard $SHARD} ${TAG:+--tag $TAG}
 echo "finished $(date)"

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Fill wikidata_cache.json["entity_full"] for every QID in qid_list.json, 50 QIDs per API request
+Fill wikidata_cache.json["entity_full"] for every QID in qid_list.json (and the per-job qid_list.<tag>.json files), 50 QIDs per API request
 (see wikidata_api.py). QIDs that are already cached with the full record are skipped, so it can be re-run
 and resumed. utils.py reads the same file, so RACOON never has to query Wikidata live for these QIDs.
 
@@ -14,6 +14,7 @@ from pathlib import Path
 
 SRC = Path(__file__).resolve().parent
 sys.path.insert(0, str(SRC))
+from merge_qid_lists import load_all_qids  # noqa: E402
 from wikidata_api import fetch_entities  # noqa: E402
 
 QID_LIST = SRC / "qid_list.json"
@@ -29,7 +30,7 @@ def save(cache):
 
 
 def main():
-    qids = list(json.load(open(QID_LIST, encoding="utf-8")))
+    qids = list(load_all_qids())  # union of qid_list.json and the per-job qid_list.<tag>.json files
     cache = json.load(open(CACHE, encoding="utf-8")) if CACHE.exists() else {}
     cache.setdefault("entity_full", {})
     cache.setdefault("relation", {})
