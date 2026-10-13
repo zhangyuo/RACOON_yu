@@ -20,3 +20,4 @@ src/wikidata_cache.json.tmp
 src/qid_list.json
 src/qid_list.*.json
 !src/qid_list.baseline.json
+*.bak
