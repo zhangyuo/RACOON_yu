@@ -22,9 +22,17 @@ MAX_ROWS = 10
 _DATASETS = {"sc": ("GitTablesSC", "sp"), "db": ("GitTablesDB", "db")}
 
 
+def _dirs(subdir: str):
+    """(directory of the source fold files, directory of type_vocab.txt). Two layouts exist: the NFS checkout keeps
+    them in data/<subdir>/raw_original and data/<subdir>/generated, the AI Cloud copy keeps everything flat in data/<subdir>."""
+    base = ROOT / "data" / subdir
+    return (base / "raw_original" if (base / "raw_original").is_dir() else base,
+            base / "generated" if (base / "generated").is_dir() else base)
+
+
 def _vocab(subdir: str) -> dict[int, str]:
     vocab: dict[int, str] = {}
-    for line in open(ROOT / "data" / subdir / "type_vocab.txt", encoding="utf-8"):
+    for line in open(_dirs(subdir)[1] / "type_vocab.txt", encoding="utf-8"):
         parts = line.rstrip("\n").split("\t")
         if len(parts) >= 2:
             vocab[int(parts[0])] = parts[1].strip()
@@ -42,7 +50,7 @@ def load_tables(dataset: str) -> tuple[list[dict], list[str]]:
 
     by_table: dict[str, dict[int, tuple[list[str], str]]] = {}
     for i in range(5):
-        with open(ROOT / "data" / subdir / f"{prefix}_semi1_cv_{i}.csv", newline="", encoding="utf-8") as f:
+        with open(_dirs(subdir)[0] / f"{prefix}_semi1_cv_{i}.csv", newline="", encoding="utf-8") as f:
             for r in csv.DictReader(f):
                 cells = (r["data"] or "").split(";")[:MAX_ROWS]
                 class_id = int(float(r["class_id"])) if (r["class_id"] or "").strip() else -1

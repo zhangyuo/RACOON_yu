@@ -93,7 +93,9 @@ def gittables_tables(subdir, prefix):
     csv.field_size_limit(sys.maxsize)
     by_table: dict = {}
     for i in range(5):
-        with open(RAG4CTA_ROOT / "data" / subdir / f"{prefix}_semi1_cv_{i}.csv", newline="", encoding="utf-8") as f:
+        base = RAG4CTA_ROOT / "data" / subdir  # NFS layout: base/raw_original, AI Cloud layout: flat
+        folds = base / "raw_original" if (base / "raw_original").is_dir() else base
+        with open(folds / f"{prefix}_semi1_cv_{i}.csv", newline="", encoding="utf-8") as f:
             for r in csv.DictReader(f):
                 cells = (r["data"] or "").split(";")
                 by_table.setdefault(r["table_id"], {}).setdefault(int(r["col_idx"]), (cells, _is_labeled(r["class_id"])))
