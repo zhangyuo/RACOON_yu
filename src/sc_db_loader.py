@@ -3,7 +3,7 @@
 Tables of GitTablesSC / GitTablesDB for RACOON_CTA.py, read directly from the source fold files
     data/<GitTablesSC|GitTablesDB>/<sp|db>_semi1_cv_{0..4}.csv      (table_id, col_idx, class, class_id, data)
 where the cells of a column are separated by ';'. All tables of the dataset are used (no train/valid/test split), the
-cells are the real cells (no splitting into words) and only the first 10 rows are kept, like in build_qid_list.py.
+cells are the real cells (no splitting into words) and only the first 6 rows are kept, like build_qid_list.py.
 
 Columns without a label (class_id -1) stay in the table as context, but gold_types marks them '-1', so RACOON_CTA.py
 never asks about them. Gold labels are only carried along to join the predictions back for the evaluation.
@@ -18,7 +18,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(os.getenv("RAG4CTA_ROOT", os.path.expanduser("~/RAG4CTA")))
-MAX_ROWS = 10
+MAX_ROWS = 6  # project rule: only the first 6 rows of every column are used (RACOON default would be 10)
 _DATASETS = {"sc": ("GitTablesSC", "sp"), "db": ("GitTablesDB", "db")}
 
 
@@ -40,7 +40,7 @@ def _vocab(subdir: str) -> dict[int, str]:
 
 
 def load_tables(dataset: str) -> tuple[list[dict], list[str]]:
-    """Returns (tables, label_set). Each table: table_id, table_raw (row-major, <=10 rows), num_col,
+    """Returns (tables, label_set). Each table: table_id, table_raw (row-major, <=6 rows), num_col,
     col_ids (source col_idx per column), gold_types (label name per column, '-1' = unlabeled)."""
     if dataset not in _DATASETS:
         raise ValueError(f"unsupported dataset {dataset!r}, expected one of {list(_DATASETS)}")

@@ -27,7 +27,7 @@ from pruning import *
 from utils import *
 
 # SC / DB tables come from src/sc_db_loader.py (reads the GitTables source fold files, see its docstring)
-from sc_db_loader import load_tables as load_sc_db_tables
+from sc_db_loader import load_tables as load_sc_db_tables, MAX_ROWS  # MAX_ROWS = 6: rows used per column
 
 # RAG4CTA fix: see utils.py -- same data_dir override, home filesystem is nearly full.
 refined = Refined.from_pretrained(model_name='wikipedia_model',
@@ -139,7 +139,7 @@ def main():
             # actually scored; the rest of the table is still full context
             # (CSV_like below still uses all num_col columns).
             targets = [i for i in range(num_col) if example['gold_types'][i] != '-1']
-        x = min(len(table_raw),10)
+        x = min(len(table_raw), MAX_ROWS)  # only the first MAX_ROWS (6) rows of every column, for every dataset
         y = len(table_raw[0])
         table = []
         all_preds = []

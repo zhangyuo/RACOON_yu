@@ -39,7 +39,7 @@ RAG4CTA_ROOT = Path(os.getenv("RAG4CTA_ROOT", os.path.expanduser("~/RAG4CTA")))
 OUT = SRC / "qid_list.json"
 PROGRESS = SRC / "qid_list.progress.json"
 SAVE_EVERY = 20000
-MAX_ROWS = 10  # RACOON_CTA.py links only the first 10 rows
+MAX_ROWS = 6  # project rule: only the first 6 rows of every column are used
 
 from KG_Linker import get_column_wise_spans  # noqa: E402
 from utils import process_EL_res, parse_example  # noqa: E402
