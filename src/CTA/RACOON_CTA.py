@@ -26,10 +26,7 @@ from KG_Linker import get_column_wise_spans
 from pruning import *
 from utils import *
 
-# RAG4CTA adaptation: reuse RAG4CTA's own SC/GitTablesDB loaders instead of
-# RACOON's TURL-only test.table_col_type.json + parse_example. See
-# sc_db_loader.py's docstring for exactly what is and isn't reused.
-sys.path.append(os.path.join(os.getenv('RAG4CTA_ROOT', '/nfs/srv/data2/af62lp@cs.aau.dk/RAG4CTA'), 'scripts/racoon_adapter'))
+# SC / DB tables come from src/sc_db_loader.py (reads the GitTables source fold files, see its docstring)
 from sc_db_loader import load_tables as load_sc_db_tables
 
 # RAG4CTA fix: see utils.py -- same data_dir override, home filesystem is nearly full.
