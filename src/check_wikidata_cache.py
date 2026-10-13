@@ -139,7 +139,7 @@ def main():
     else:
         sample = random.Random(args.seed).sample(cached, min(args.sample, len(cached)))
         print(f"== 3. cross-check of {len(sample)} random QIDs against the Wikidata MCP service")
-        compared, bad_types, bad_label, bad_desc, unavailable = 0, [], [], [], 0
+        compared, bad_types, bad_label, bad_desc, unavailable, extra_ranks = 0, [], [], [], 0, 0
         for q in sample:
             text = mcp_statements(q)
             time.sleep(1.5)  # the service answers 429 to bursts
@@ -152,14 +152,18 @@ def main():
                 continue
             compared += 1
             r = full[q]
-            if types != {b["type_qid"] for b in r["raw_bindings"]}:
-                bad_types.append((q, sorted(types), sorted({b["type_qid"] for b in r["raw_bindings"]})))
+            ours = {b["type_qid"] for b in r["raw_bindings"]}
+            if types - ours:  # a type the MCP service lists is missing from the cache: a real error
+                bad_types.append((q, sorted(types), sorted(ours)))
+            elif ours - types:  # MCP lists only the best-ranked P31 values, the cache keeps all ranks (as the SPARQL query did)
+                extra_ranks += 1
             if label != r["label"]:
                 bad_label.append((q, label, r["label"]))
             if (desc or "") != r["description"]:
                 bad_desc.append((q, desc, r["description"]))
         print(f"   compared {compared} (MCP gave no answer for {unavailable})")
-        print(f"   P31 types differ: {len(bad_types)} | label differs: {len(bad_label)} | description differs: {len(bad_desc)}")
+        print(f"   P31 types missing from the cache: {len(bad_types)} | label differs: {len(bad_label)} | description differs: {len(bad_desc)}")
+        print(f"   cache has extra lower-rank P31 types (expected, MCP lists only the best rank): {extra_ranks}")
         for name, rows in (("types", bad_types), ("label", bad_label), ("description", bad_desc)):
             for row in rows[:3]:
                 print(f"     {name}: {row}")
