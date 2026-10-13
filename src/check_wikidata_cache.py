@@ -59,7 +59,7 @@ def check_structure(qid, r):
     return errs
 
 
-def mcp_statements(qid, retries=6):
+def mcp_statements(qid, retries=4):
     for attempt in range(retries):
         try:
             req = urllib.request.Request(MCP.format(qid=qid), method="POST")
@@ -68,7 +68,7 @@ def mcp_statements(qid, retries=6):
         except urllib.error.HTTPError as e:
             if e.code != 429:
                 return None
-            time.sleep(5 * (attempt + 1))
+            time.sleep(3 * (attempt + 1))
         except Exception:
             time.sleep(3)
     return None
@@ -140,7 +140,9 @@ def main():
         sample = random.Random(args.seed).sample(cached, min(args.sample, len(cached)))
         print(f"== 3. cross-check of {len(sample)} random QIDs against the Wikidata MCP service")
         compared, bad_types, bad_label, bad_desc, unavailable, extra_ranks = 0, [], [], [], 0, 0
-        for q in sample:
+        for i, q in enumerate(sample):
+            if i % 10 == 0:
+                print(f"   ... {i}/{len(sample)} checked", flush=True)
             text = mcp_statements(q)
             time.sleep(1.5)  # the service answers 429 to bursts
             if not text:
