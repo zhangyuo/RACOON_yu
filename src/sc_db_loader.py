@@ -39,14 +39,30 @@ def _vocab(subdir: str) -> dict[int, str]:
     return vocab
 
 
-def load_tables(dataset: str) -> tuple[list[dict], list[str]]:
+def _test_targets(subdir: str, vocab: dict[int, str]) -> dict[tuple[str, int], str]:
+    """{(table_id, col_idx): label name} of the labeled columns of the test split (test.csv)."""
+    out: dict[tuple[str, int], str] = {}
+    with open(_dirs(subdir)[1] / "test.csv", newline="", encoding="utf-8", errors="replace") as f:
+        for r in csv.DictReader(line.replace("\x00", "") for line in f):
+            label = int(float(r["label"])) if (r["label"] or "").strip() else -1
+            if label >= 0:
+                out[(r["table_id"], int(r["column_index"]))] = vocab.get(label, str(label))
+    return out
+
+
+def load_tables(dataset: str, split: str = "test") -> tuple[list[dict], list[str]]:
     """Returns (tables, label_set). Each table: table_id, table_raw (row-major, <=6 rows), num_col,
-    col_ids (source col_idx per column), gold_types (label name per column, '-1' = unlabeled)."""
+    col_ids (source col_idx per column), gold_types (label name per column, '-1' = not asked).
+
+    split="test": the whole table with ALL its columns is the context (as in the original RACOON), but only the labeled
+    columns that are in test.csv get a gold type, i.e. are asked; tables without such a column are left out.
+    split="all": every labeled column of every table is asked."""
     if dataset not in _DATASETS:
         raise ValueError(f"unsupported dataset {dataset!r}, expected one of {list(_DATASETS)}")
     subdir, prefix = _DATASETS[dataset]
     vocab = _vocab(subdir)
     csv.field_size_limit(sys.maxsize)
+    asked = _test_targets(subdir, vocab) if split == "test" else None
 
     by_table: dict[str, dict[int, tuple[list[str], str]]] = {}
     for i in range(5):
@@ -60,6 +76,9 @@ def load_tables(dataset: str) -> tuple[list[dict], list[str]]:
     tables = []
     for table_id, cols in by_table.items():
         col_ids = sorted(cols)
+        gold = [cols[c][1] if (asked is None or (table_id, c) in asked) else "-1" for c in col_ids]
+        if all(g == "-1" for g in gold):
+            continue  # nothing to ask in this table
         columns = [cols[c][0] for c in col_ids]
         n_rows = max(1, max((len(c) for c in columns), default=0))
         tables.append({
@@ -68,6 +87,6 @@ def load_tables(dataset: str) -> tuple[list[dict], list[str]]:
                           for r in range(n_rows)],
             "num_col": len(col_ids),
             "col_ids": col_ids,
-            "gold_types": [cols[c][1] for c in col_ids],
+            "gold_types": gold,
         })
     return tables, [vocab[k] for k in sorted(vocab)]
