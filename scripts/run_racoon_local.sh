@@ -7,7 +7,7 @@
 set -e
 cd "$(dirname "$0")/.."
 NFS=${NFS:-/nfs/srv/data2/af62lp@cs.aau.dk}
-export RAG4CTA_ROOT=${RAG4CTA_ROOT:-$NFS/RAG4CTA}
+export RAG4CTA_ROOT=${RAG4CTA_ROOT:-$HOME/RAG4CTA}   # local project: .env here, data/ is a link to NFS
 export REFINED_CACHE_DIR=${REFINED_CACHE_DIR:-$NFS/refined_cache}
 PY=${PY:-$NFS/miniconda3/envs/racoon/bin/python}
 export CUDA_VISIBLE_DEVICES=${GPU:-1}
