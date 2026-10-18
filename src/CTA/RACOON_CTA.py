@@ -214,13 +214,25 @@ def main():
             pruned_table_rel = pruning_rel(CSV_like, table_relations)
             hint = "This table's columns are related in Wikidata as follows: " + pruned_table_rel
 
-        hints.append(hint)
-
         # --------------------- Generation --------------------- #
-        
-        messages = [{
-                "role": "system",
-                "content": f"""You are a data type analysis agent designed to annotate columns with semantic types. Your task is to:
+        # Paper form (RACOON, Wei et al., Appendix A): every column is annotated with its OWN prompt, which carries the
+        # whole table, the label set and the KG hint of that column. Nothing is carried over from the other columns
+        # (the released code kept one growing conversation per table, so every further column made the prompt longer).
+
+        def column_hint(c):
+            if info == "type":
+                return (serialize_dict(hint_list[c]) if c < len(hint_list)
+                        else "Entities in this column are instances of the following wikidata entities: ")
+            if info == "entity":
+                return f"The entity labels in the Wikidata knowledge graph corresponding to the cells in this column are provided as a list: {hint_strings[c]}."
+            if info == "des":
+                return f"The entity labels with descriptions in the Wikidata knowledge graph corresponding to the cells in this column are provided as a list: {hint_strings[c]}."
+            return hint  # relation: one hint for the whole table
+
+        def annotate_column(col, hint):
+            messages = [{
+                    "role": "system",
+                    "content": f"""You are a data type analysis agent designed to annotate columns with semantic types. Your task is to:
             1. **Analyze** the given column data in the context of the entire table.
             2. **Consider** a Wikidata hint if given. 
             3. **Reason** carefully to select the best single type from the given list.
@@ -229,14 +241,14 @@ def main():
             Follow this format precisely:
             THOUGHT PROCESS: [Brief reasoning, mention if using/ignoring hint]
             FINAL ANSWER: [only the JSON output here]"""
-            },
-            {
-                "role": "user",
-                "content": f"""Consider this table with {num_col} columns given in Comma-separated Values format:
+                },
+                {
+                    "role": "user",
+                    "content": f"""Consider this table with {num_col} columns given in Comma-separated Values format:
                         {CSV_like}
-                        There are a list of {len(label_set)} valid types for each column: {label_set}. Your task is to choose only one type from the list to annotate Column {targets[0]+1}.
+                        There are a list of {len(label_set)} valid types for each column: {label_set}. Your task is to choose only one type from the list to annotate Column {col+1}.
             Solve this task by following these steps:
-            1. **Analyze the data in Column {targets[0]+1} in the context of the entire table**
+            1. **Analyze the data in Column {col+1} in the context of the entire table**
             2. **Evaluate the Wikidata hint if not empty: {hint}**:
             - Use the hint to enhance your understanding of the column data.
             3. **Select the best type** from the given label set. 
@@ -249,55 +261,9 @@ def main():
             Example:
             THOUGHT: The data in this column consists of names of sports teams. The hint lists 'football_club (7 cells)', which confirms that the column is about sports teams. I select 'sports_team'.
             FINAL ANSWER: {{"type": ["sports_team"]}}"""}
-        ]
+            ]
 
-        chatgpt_msg = response(messages, model)
-        prediction = chatgpt_msg.content
-        predicted_type = parse_pred(prediction)
-        messages.append(dict(chatgpt_msg))
-        col_prompt_tok, col_completion_tok = last_usage["prompt_tokens"], last_usage["completion_tokens"]
 
-        if predicted_type not in label_set:
-            messages.append({"role": "user",
-                "content": f"""Your prediction {predicted_type} is not in the given label set. Please try again to choose the closest label in the given set to annotate the first column. Choose only one valid type from the given list of types. Check that the type MUST MUST MUST be in the list. Give the answer in valid JSON format. DO NOT include any explanation or additional text."""})
-            chatgpt_msg = response(messages, model)
-            prediction = chatgpt_msg.content
-            messages.append(dict(chatgpt_msg))
-            predicted_type = parse_json_pred(prediction)
-            col_prompt_tok += last_usage["prompt_tokens"]
-            col_completion_tok += last_usage["completion_tokens"]
-
-        all_preds.append((predicted_type, prediction, col_prompt_tok, col_completion_tok))
-
-        for i in targets[1:]:  # RAG4CTA: only the remaining evaluable columns
-
-            if info == "type":
-                if i >= len(hint_list): hint = "Entities in this column are instances of the following wikidata entities: "
-                else: 
-                    hint = serialize_dict(hint_list[i])
-            elif info == "entity":
-                hint = f"The entity labels in the Wikidata knowledge graph corresponding to the cells in this column are provided as a list: {hint_strings[i]}."
-            elif info == "des":
-                hint = f"The entity labels with descriptions in the Wikidata knowledge graph corresponding to the cells in this column are provided as a list: {hint_strings[i]}."
-            hints.append(hint)
-            
-            messages.append(
-            {
-                "role": "user",
-                "content": f"""Your task is to choose only one type from the list to annotate Column {i+1}. 
-            Solve this task by following these steps:
-            1. **Analyze the data in Column {i+1} in the context of the entire table**
-            2. **Evaluate the Wikidata hint if not empty: {hint}**:
-            - Use the hint to enhance your understanding of the column data.
-            3. **Select the best type** from the given label set. 
-            - Ensure the type best summarizes every cell in the column.
-            - Ensure it aligns with the context of the whole table.
-            - Verify your chosen type MUST be in the provided list.
-            4. **Output**:
-            - First, explain your reasoning (non-JSON).
-            - Finally, output **ONLY** the JSON answer in this format: {res_format}."""
-            })
-            
             chatgpt_msg = response(messages, model)
             prediction = chatgpt_msg.content
             predicted_type = parse_pred(prediction)
@@ -308,13 +274,19 @@ def main():
                 messages.append({"role": "user",
                     "content": f"""Your prediction {predicted_type} is not in the given label set. Please try again to choose the closest label in the given set to annotate the first column. Choose only one valid type from the given list of types. Check that the type MUST MUST MUST be in the list. Give the answer in valid JSON format. DO NOT include any explanation or additional text."""})
                 chatgpt_msg = response(messages, model)
-                pred = chatgpt_msg.content
+                prediction = chatgpt_msg.content
                 messages.append(dict(chatgpt_msg))
-                predicted_type = parse_json_pred(pred)
+                predicted_type = parse_json_pred(prediction)
                 col_prompt_tok += last_usage["prompt_tokens"]
                 col_completion_tok += last_usage["completion_tokens"]
 
-            all_preds.append((predicted_type, prediction, col_prompt_tok, col_completion_tok))
+            return (predicted_type, prediction, col_prompt_tok, col_completion_tok)
+
+        hints.clear()
+        for col in targets:
+            col_hint = column_hint(col)
+            hints.append(col_hint)
+            all_preds.append(annotate_column(col, col_hint))
 
         with open(OUTPUT, "a", newline="", encoding="UTF-8") as output:
             writer = csv.writer(output)
