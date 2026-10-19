@@ -26,7 +26,7 @@ from KG_Linker import get_column_wise_spans
 from pruning import *
 from utils import *
 
-# SC / DB tables come from src/sc_db_loader.py (reads the GitTables source fold files, see its docstring)
+# SC / DB tables come from src/sc_db_loader.py (reads data/<dataset>/{train,valid,test}.csv, see its docstring)
 from sc_db_loader import load_tables as load_sc_db_tables, MAX_ROWS  # MAX_ROWS = 6: rows used per column
 
 # RAG4CTA fix: see utils.py -- same data_dir override, home filesystem is nearly full.
@@ -72,8 +72,8 @@ def main():
     parser.add_argument('--model', type=str, default='gpt-4o-mini',
                         help='OpenAI model to use (default: gpt-4o-mini; ignored for GLM, see utils.response)')
     parser.add_argument('--dataset', type=str, default='turl',
-                        choices=['turl', 'sc', 'db'],
-                        help='Dataset: turl (original) or sc/db (RAG4CTA GitTablesSC/DB, via sc_db_loader)')
+                        choices=['turl', 'sc', 'db', 'biodiv_db', 'biodiv_wiki'],
+                        help='Dataset: turl (original) or sc/db/biodiv_db/biodiv_wiki (RAG4CTA datasets, via sc_db_loader)')
     parser.add_argument('--context', type=str, default='col',
                         choices=['wikiAPI', 'cell', 'table', 'col', 'hybrid'],
                         help='Context type (default: hybrid)')
@@ -82,6 +82,14 @@ def main():
                         help='Information type (default: type)')
     parser.add_argument('--max_tables', type=int, default=None,
                         help='RAG4CTA addition: cap the number of tables processed, for smoke tests')
+    parser.add_argument('--label_setting', type=str, default='single_label',
+                        choices=['single_label', 'multi_label'],
+                        help='RAG4CTA addition: single_label = the model picks ONE type per column (the prompt of the paper); '
+                             'multi_label = the model lists ALL types that apply (same prompt, only the selection rule '
+                             'and the example change). The two settings are separate runs with separate result files.')
+    parser.add_argument('--shard', type=str, default=None,
+                        help='RAG4CTA addition: K/N, process only the tables with index %% N == K (parallel runs). '
+                             'Every shard writes its own file RACOON_..._shardKofN.csv; concatenate them afterwards.')
 
     args = parser.parse_args()
 
@@ -90,6 +98,7 @@ def main():
     dataset = args.dataset
     context = args.context
     info = args.info
+    multi = args.label_setting == 'multi_label'
 
     if dataset != 'turl' and context == 'wikiAPI':
         raise NotImplementedError("wikiAPI context needs `colset`, which sc_db_loader does not build; "
@@ -105,9 +114,10 @@ def main():
     #    was a path relative to cwd. Write to <RACOON repo root>/outputs/ instead.
     model_label = os.environ.get('VLLM_MODEL', 'zai-org/GLM-4-9B-0414').replace('/', '-')
     racoon_root = Path(__file__).resolve().parent.parent.parent
-    OUTPUT = str(racoon_root / 'outputs' / model_label /
-                 (f"RACOON_{context}_{info}.csv" if dataset == 'turl'
-                  else f"{dataset}/RACOON_{context}_{info}.csv"))
+    shard_k, shard_n = (int(x) for x in args.shard.split('/')) if args.shard else (0, 1)
+    shard_tag = f".shard{shard_k}of{shard_n}" if args.shard else ""
+    OUTPUT = str(racoon_root / 'outputs' / model_label / dataset / args.label_setting /
+                 f"RACOON_{context}_{info}{shard_tag}.csv")
     os.makedirs(os.path.dirname(OUTPUT), exist_ok=True)
 
     res_format = "{'type': []}"
@@ -128,8 +138,10 @@ def main():
         examples = [t for t in examples if any(g != '-1' for g in t['gold_types'])]
     if args.max_tables is not None:
         examples = examples[:args.max_tables]
+    # `id` stays the index of the table in the full list, so the rows of all shards can be concatenated
+    indexed = [(i, e) for i, e in enumerate(examples) if i % shard_n == shard_k]
 
-    for id, example in enumerate(tqdm(examples)):
+    for id, example in tqdm(indexed):
         if dataset == 'turl':
             table_raw, table_with_en, label, headers, meta_data, num_col, max_num_row, colset = parse_example(example)
             targets = list(range(num_col))
@@ -229,13 +241,43 @@ def main():
                 return f"The entity labels with descriptions in the Wikidata knowledge graph corresponding to the cells in this column are provided as a list: {hint_strings[c]}."
             return hint  # relation: one hint for the whole table
 
+        # Selection rule of the prompt. single_label is the prompt of the code/paper, unchanged. multi_label follows the
+        # multi-label prompt of the paper (Appendix A.2): "choose one or multiple types", step "Mark each type in the given
+        # list with 0 or 1 ...", step "Give a list of types that you have marked 1 ...". Three places are not given by the
+        # paper (the code's own system-prompt line, its worked example, its retry message) and reuse the paper's wording.
+        if multi:
+            w_sys = "choose one or multiple types from the given list"
+            w_task = "choose one or multiple types from the list"
+            w_step3 = ("Mark each type in the given list with 0 or 1. Mark a type with 1 if it can better represent all cells "
+                       "of Column {c}. Mark a type with 0 otherwise.")
+            w_ens1 = ""
+            w_ens3 = ""
+            w_out = ("\n            - Give a list of types that you have marked 1 in the previous step. "
+                     "Check that the types MUST be in the list.")
+            w_example = ('THOUGHT: The data in this column consists of names of sports teams. The hint lists \'football_club (7 cells)\', '
+                         'which confirms that the column is about sports teams, and a sports team is also an organization. '
+                         'I mark \'sports_team\' and \'organization\' with 1 and every other type with 0.\n            '
+                         'FINAL ANSWER: {"type": ["sports_team", "organization"]}')
+            w_retry = "Choose one or multiple valid types from the given list of types. Check that the types MUST MUST MUST be in the list."
+        else:
+            w_sys = "select the best single type from the given list"
+            w_task = "choose only one type from the list"
+            w_step3 = "**Select the best type** from the given label set. "
+            w_ens1 = "\n            - Ensure the type best summarizes every cell in the column."
+            w_ens3 = "\n            - Verify your chosen type MUST be in the provided list."
+            w_out = ""
+            w_example = ('THOUGHT: The data in this column consists of names of sports teams. The hint lists \'football_club (7 cells)\', '
+                         'which confirms that the column is about sports teams. I select \'sports_team\'.\n            '
+                         'FINAL ANSWER: {"type": ["sports_team"]}')
+            w_retry = "Choose only one valid type from the given list of types. Check that the type MUST MUST MUST be in the list."
+
         def annotate_column(col, hint):
             messages = [{
                     "role": "system",
                     "content": f"""You are a data type analysis agent designed to annotate columns with semantic types. Your task is to:
             1. **Analyze** the given column data in the context of the entire table.
             2. **Consider** a Wikidata hint if given. 
-            3. **Reason** carefully to select the best single type from the given list.
+            3. **Reason** carefully to {w_sys}.
             4. **Output** ONLY in valid JSON format: {res_format}.
 
             Follow this format precisely:
@@ -246,40 +288,39 @@ def main():
                     "role": "user",
                     "content": f"""Consider this table with {num_col} columns given in Comma-separated Values format:
                         {CSV_like}
-                        There are a list of {len(label_set)} valid types for each column: {label_set}. Your task is to choose only one type from the list to annotate Column {col+1}.
+                        There are a list of {len(label_set)} valid types for each column: {label_set}. Your task is to {w_task} to annotate Column {col+1}.
             Solve this task by following these steps:
             1. **Analyze the data in Column {col+1} in the context of the entire table**
             2. **Evaluate the Wikidata hint if not empty: {hint}**:
             - Use the hint to enhance your understanding of the column data.
-            3. **Select the best type** from the given label set. 
-            - Ensure the type best summarizes every cell in the column.
-            - Ensure it aligns with the context of the whole table.
-            - Verify your chosen type MUST be in the provided list.
+            3. {w_step3.format(c=col+1)}{w_ens1}
+            - Ensure it aligns with the context of the whole table.{w_ens3}
             4. **Output**:
-            - First, explain your reasoning (non-JSON).
+            - First, explain your reasoning (non-JSON).{w_out}
             - Finally, output **ONLY** the JSON answer in this format: {res_format}.
             Example:
-            THOUGHT: The data in this column consists of names of sports teams. The hint lists 'football_club (7 cells)', which confirms that the column is about sports teams. I select 'sports_team'.
-            FINAL ANSWER: {{"type": ["sports_team"]}}"""}
+            {w_example}"""}
             ]
 
 
             chatgpt_msg = response(messages, model)
             prediction = chatgpt_msg.content
-            predicted_type = parse_pred(prediction)
+            predicted_type = parse_pred_list(prediction) if multi else parse_pred(prediction)
             messages.append(dict(chatgpt_msg))
             col_prompt_tok, col_completion_tok = last_usage["prompt_tokens"], last_usage["completion_tokens"]
 
-            if predicted_type not in label_set:
+            if (not predicted_type or any(t not in label_set for t in predicted_type)) if multi else predicted_type not in label_set:
                 messages.append({"role": "user",
-                    "content": f"""Your prediction {predicted_type} is not in the given label set. Please try again to choose the closest label in the given set to annotate the first column. Choose only one valid type from the given list of types. Check that the type MUST MUST MUST be in the list. Give the answer in valid JSON format. DO NOT include any explanation or additional text."""})
+                    "content": f"""Your prediction {predicted_type} is not in the given label set. Please try again to choose the closest label in the given set to annotate the first column. {w_retry} Give the answer in valid JSON format. DO NOT include any explanation or additional text."""})
                 chatgpt_msg = response(messages, model)
                 prediction = chatgpt_msg.content
                 messages.append(dict(chatgpt_msg))
-                predicted_type = parse_json_pred(prediction)
+                predicted_type = parse_json_pred_list(prediction) if multi else parse_json_pred(prediction)
                 col_prompt_tok += last_usage["prompt_tokens"]
                 col_completion_tok += last_usage["completion_tokens"]
 
+            if multi:  # the vocabulary types only, deduplicated, in the order given; stored as 'a;b;c'
+                predicted_type = ";".join(dict.fromkeys(t for t in predicted_type if t in label_set))
             return (predicted_type, prediction, col_prompt_tok, col_completion_tok)
 
         hints.clear()

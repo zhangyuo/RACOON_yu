@@ -6,11 +6,10 @@ write every distinct Wikidata QID that was linked to qid_list.json (next to this
 Format: {qid: [table_id, col_idx, cell_text]}  (one example mention per QID)
 
 The scan feeds ReFinED exactly what RACOON_CTA.py feeds it: the first 10 rows of a table, linked column by column.
-  * SC / DB  : the source fold files data/GitTablesSC/sp_semi1_cv_{0..4}.csv and data/GitTablesDB/db_semi1_cv_{0..4}.csv,
-               cells split on ';' (all folds, no train/valid/test split).
+  * SC / DB  : the shared dataset files data/GitTablesSC/{train,valid,test}.csv and data/GitTablesDB/{train,valid,test}.csv,
+               cells split on ';' (the three files together, so every table of the dataset).
   * TURL     : the original *.table_col_type.json parsed with RACOON's own parse_example
                (data/WikiTables-TURL-CTA/{test,dev,train}.table_col_type.json).
-  The converted train/valid/test CSVs are not used: they split multi-word cells into words.
 
 Units are scanned in this order: sc, db, turl_test, turl_dev, turl_train. qid_list.json is saved after every unit
 (and every 20000 tables inside a unit); finished units are recorded in qid_list.progress.json, so a re-run resumes.
@@ -45,6 +44,8 @@ from KG_Linker import get_column_wise_spans  # noqa: E402
 from utils import process_EL_res, parse_example  # noqa: E402
 
 UNITS = ["sc", "db", "turl_test", "turl_dev", "turl_train"]
+# datasets added later, scanned on their TEST split only (the only split RACOON annotates); cells separated by ';'
+SHARED_TEST_UNITS = {"biodiv_db": "BiodivTab-DB-CTA", "biodiv_wiki": "BiodivTab-Wiki-CTA", "viznet": "VizNet-CTA"}
 TURL_FILES = {"turl_test": "test", "turl_dev": "dev", "turl_train": "train"}
 
 
@@ -86,19 +87,17 @@ def _is_labeled(class_id):
         return False
 
 
-def gittables_tables(subdir, prefix):
-    """(table_id, rows, labeled column indices) for every table of a GitTables dataset, read from the source fold files
-    data/<subdir>/<prefix>_semi1_cv_{0..4}.csv (columns table_id, col_idx, class, class_id, data;
-    the cells of a column are separated by ';'). No train/valid/test split, no re-conversion."""
+def gittables_tables(subdir, splits=("train", "valid", "test")):
+    """(table_id, rows, labeled column indices) for every table of a dataset in the shared format, read from
+    data/<subdir>/<split>.csv (columns table_id, column_index, label, data; the cells of a column are separated by ';').
+    The split is by whole table, so train + valid + test together hold every table once."""
     csv.field_size_limit(sys.maxsize)
     by_table: dict = {}
-    for i in range(5):
-        base = RAG4CTA_ROOT / "data" / subdir  # NFS layout: base/raw_original, AI Cloud layout: flat
-        folds = base / "raw_original" if (base / "raw_original").is_dir() else base
-        with open(folds / f"{prefix}_semi1_cv_{i}.csv", newline="", encoding="utf-8") as f:
-            for r in csv.DictReader(f):
+    for split in splits:
+        with open(RAG4CTA_ROOT / "data" / subdir / f"{split}.csv", newline="", encoding="utf-8", errors="replace") as f:
+            for r in csv.DictReader(line.replace("\x00", "") for line in f):
                 cells = (r["data"] or "").split(";")
-                by_table.setdefault(r["table_id"], {}).setdefault(int(r["col_idx"]), (cells, _is_labeled(r["class_id"])))
+                by_table.setdefault(r["table_id"], {}).setdefault(int(r["column_index"]), (cells, _is_labeled(r["label"])))
     for tid, cols in by_table.items():
         order = sorted(cols)
         columns = [cols[c][0][:MAX_ROWS] for c in order]
@@ -145,8 +144,10 @@ def main():
             continue
         if unit in TURL_FILES:
             tables = turl_tables(TURL_FILES[unit])
+        elif unit in SHARED_TEST_UNITS:
+            tables = gittables_tables(SHARED_TEST_UNITS[unit], splits=("test",))
         else:
-            tables = gittables_tables(*{"sc": ("GitTablesSC", "sp"), "db": ("GitTablesDB", "db")}[unit])
+            tables = gittables_tables({"sc": "GitTablesSC", "db": "GitTablesDB"}[unit])
         t0, n, failed, no_label = time.time(), 0, [], 0
         for table_index, (table_id, rows, targets) in enumerate(tables):
             if table_index % shard_n != shard_k:

@@ -21,3 +21,6 @@ src/qid_list.json
 src/qid_list.*.json
 !src/qid_list.baseline.json
 *.bak
+
+# large data files copied from the original RACOON release
+src/data/*.json

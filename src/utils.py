@@ -58,6 +58,10 @@ _entity_full_cache = _wikidata_cache["entity_full"]   # kept as a local alias, s
 _relation_cache = _wikidata_cache["relation"]         # kept as a local alias, same dict object
 
 def _save_wikidata_cache():
+    # RAG4CTA addition: parallel runs share one cache file. Every save rewrites the whole file, so concurrent processes would
+    # overwrite each other; with WIKIDATA_CACHE_READONLY=1 a process keeps new entities in memory only.
+    if os.environ.get("WIKIDATA_CACHE_READONLY"):
+        return
     with open(_WIKIDATA_CACHE_PATH, "w", encoding="utf-8") as f:
         json.dump(_wikidata_cache, f, ensure_ascii=False)
 
@@ -613,6 +617,32 @@ def parse_json_pred(prediction):  # parse a JSON response
         
 
     return predicted_type
+
+
+def _types_from_json(obj):
+    """['type'] of a parsed answer as a list of strings (a bare string counts as one type)."""
+    t = obj['type']
+    t = [t] if isinstance(t, str) else list(t)
+    return [str(x).strip() for x in t if str(x).strip()]
+
+
+def parse_pred_list(prediction):  # multi-label: ALL types of "FINAL ANSWER: {'type': [...]}"
+    try:
+        final_answer_start = prediction.find("FINAL ANSWER:") + len("FINAL ANSWER:")
+        final_answer_json = json.loads(prediction[final_answer_start:].strip().replace("'", '"'))
+        return _types_from_json(final_answer_json)
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+        return []
+
+
+def parse_json_pred_list(prediction):  # multi-label: ALL types of a bare JSON response
+    try:
+        match = re.search(r'\{.*\}', prediction)
+        if not match:
+            return []
+        return _types_from_json(json.loads(match.group(0).replace("'", '"')))
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+        return []
 
 def f1_score_multilabel(true_list, pred_list):
     true_list = np.array(true_list)
