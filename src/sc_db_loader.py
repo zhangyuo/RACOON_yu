@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Tables of GitTablesSC / GitTablesDB / BiodivTab-DB-CTA / BiodivTab-Wiki-CTA for RACOON_CTA.py, read from the shared dataset files
+Tables of GitTablesSC / GitTablesDB / BiodivTab-DB-CTA / BiodivTab-Wiki-CTA / SOTAB-CTA for RACOON_CTA.py, read from the shared dataset files
     data/<dataset>/{train,valid,test}.csv                       (table_id, column_index, label, data; a column with several gold
                                                                  types has one row per gold type, every cell of the table is here)
     data/<dataset>/single_label/{split}.csv                     columns with exactly one gold type
@@ -15,6 +15,9 @@ they are the real cells (no splitting into words) and only the first 6 rows are 
 Columns without a label (label -1) stay in the table as context, but gold_types marks them '-1', so RACOON_CTA.py
 never asks about them. Gold labels are only carried along to join the predictions back for the evaluation.
 
+SOTAB-CTA: the shared file joins the cells of a column with a plain space, so the real cells come from the official SOTAB tables
+(sotab_cells.py, first 6 non-empty cells of every column); structure (all columns) and gold are read from the shared files as above.
+
 Env var RAG4CTA_ROOT: checkout that holds data/ (default ~/RAG4CTA).
 """
 from __future__ import annotations  # RACOON runs on Python 3.8
@@ -26,7 +29,8 @@ from pathlib import Path
 
 ROOT = Path(os.getenv("RAG4CTA_ROOT", os.path.expanduser("~/RAG4CTA")))
 MAX_ROWS = 6  # project rule: only the first 6 rows of every column are used (RACOON default would be 10)
-_DATASETS = {"sc": "GitTablesSC", "db": "GitTablesDB", "biodiv_db": "BiodivTab-DB-CTA", "biodiv_wiki": "BiodivTab-Wiki-CTA"}
+_DATASETS = {"sc": "GitTablesSC", "db": "GitTablesDB", "biodiv_db": "BiodivTab-DB-CTA", "biodiv_wiki": "BiodivTab-Wiki-CTA",
+             "sotab": "SOTAB-CTA", "turl": "TURL-Wiki-CTA"}
 _SPLITS = ("train", "valid", "test")
 
 
@@ -66,6 +70,13 @@ def load_tables(dataset: str, split: str = "test") -> tuple[list[dict], list[str
     assert not any(";" in n for n in vocab.values()), "a label name contains ';', the gold separator"
     csv.field_size_limit(sys.maxsize)
 
+    real_cells = None
+    if dataset == "sotab":
+        if split != "test":
+            raise ValueError("sotab: the real cells exist for the test split only")
+        import sotab_cells
+        real_cells = sotab_cells.load("test")
+
     by_table: dict[str, dict[int, tuple[list[str], list[str]]]] = {}
     for name in (_SPLITS if split == "all" else (split,)):
         gold: dict[tuple[str, int], list[str]] = {}
@@ -78,7 +89,10 @@ def load_tables(dataset: str, split: str = "test") -> tuple[list[dict], list[str
                         gold[(r["table_id"], int(r["column_index"]))] = [vocab.get(i, str(i)) for i in ids]
         for r in _read(base / f"{name}.csv"):
             key = (r["table_id"], int(r["column_index"]))
-            cells = (r["data"] or "").split(";")[:MAX_ROWS]
+            if real_cells is not None:
+                cells = list(real_cells.get(r["table_id"], {}).get(key[1], []))[:MAX_ROWS]
+            else:
+                cells = (r["data"] or "").split(";")[:MAX_ROWS]
             by_table.setdefault(r["table_id"], {}).setdefault(key[1], (cells, gold.get(key, [])))
 
     tables = []

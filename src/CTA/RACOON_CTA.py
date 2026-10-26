@@ -28,6 +28,8 @@ from utils import *
 
 # SC / DB tables come from src/sc_db_loader.py (reads data/<dataset>/{train,valid,test}.csv, see its docstring)
 from sc_db_loader import load_tables as load_sc_db_tables, MAX_ROWS  # MAX_ROWS = 6: rows used per column
+from label_resolve import resolve_to_label_set
+from context_fit import fit_rows, table_to_text
 
 # RAG4CTA fix: see utils.py -- same data_dir override, home filesystem is nearly full.
 refined = Refined.from_pretrained(model_name='wikipedia_model',
@@ -65,6 +67,7 @@ def get_col_entity(col_spans):
             en_labels.append(entity)
     return en_labels
 
+
 def main():
  
     
@@ -72,7 +75,7 @@ def main():
     parser.add_argument('--model', type=str, default='gpt-4o-mini',
                         help='OpenAI model to use (default: gpt-4o-mini; ignored for GLM, see utils.response)')
     parser.add_argument('--dataset', type=str, default='turl',
-                        choices=['turl', 'sc', 'db', 'biodiv_db', 'biodiv_wiki'],
+                        choices=['turl', 'sc', 'db', 'biodiv_db', 'biodiv_wiki', 'sotab'],
                         help='Dataset: turl (original) or sc/db/biodiv_db/biodiv_wiki (RAG4CTA datasets, via sc_db_loader)')
     parser.add_argument('--context', type=str, default='col',
                         choices=['wikiAPI', 'cell', 'table', 'col', 'hybrid'],
@@ -87,6 +90,20 @@ def main():
                         help='RAG4CTA addition: single_label = the model picks ONE type per column (the prompt of the paper); '
                              'multi_label = the model lists ALL types that apply (same prompt, only the selection rule '
                              'and the example change). The two settings are separate runs with separate result files.')
+    parser.add_argument('--label_space', type=str, default='freebase', choices=['freebase', 'reduced'],
+                        help="RAG4CTA addition, TURL only: freebase (default) = the 255 Freebase type names of the benchmark "
+                             "(type_vocab.txt), the label set of the other methods; reduced = the 127 simplified type names of the "
+                             "original RACOON code. Results go to outputs/<model>/turl_<label_space>/; the freebase files carry "
+                             "table_id/col_id/gold columns.")
+    parser.add_argument('--only', type=str, default=None,
+                        help="RAG4CTA debugging aid: TABLE_ID:COLUMN_INDEX,... run only these columns (sc/db/biodiv datasets); "
+                             "the output file gets the tag .only")
+    parser.add_argument('--only_file', type=str, default=None,
+                        help="RAG4CTA addition: like --only, but the columns are read from a tab separated file with the lines "
+                             "TABLE_ID<TAB>COLUMN_INDEX (any dataset incl. turl, where the column index is the position in the table)")
+    parser.add_argument('--dump_dialog', type=str, default=None,
+                        help="RAG4CTA debugging aid: append the complete conversation of every asked column (system prompt, user "
+                             "prompt, answer, retry message, retry answer) as one JSON line to this file")
     parser.add_argument('--shard', type=str, default=None,
                         help='RAG4CTA addition: K/N, process only the tables with index %% N == K (parallel runs). '
                              'Every shard writes its own file RACOON_..._shardKofN.csv; concatenate them afterwards.')
@@ -115,15 +132,22 @@ def main():
     model_label = os.environ.get('VLLM_MODEL', 'zai-org/GLM-4-9B-0414').replace('/', '-')
     racoon_root = Path(__file__).resolve().parent.parent.parent
     shard_k, shard_n = (int(x) for x in args.shard.split('/')) if args.shard else (0, 1)
-    shard_tag = f".shard{shard_k}of{shard_n}" if args.shard else ""
-    OUTPUT = str(racoon_root / 'outputs' / model_label / dataset / args.label_setting /
+    shard_tag = (".rerun" if (args.only or args.only_file) else "") + (f".shard{shard_k}of{shard_n}" if args.shard else "")
+    out_name = f'turl_{args.label_space}' if dataset == 'turl' else dataset
+    OUTPUT = str(racoon_root / 'outputs' / model_label / out_name / args.label_setting / os.environ.get('RUN_TAG', '') /
                  f"RACOON_{context}_{info}{shard_tag}.csv")
     os.makedirs(os.path.dirname(OUTPUT), exist_ok=True)
 
     res_format = "{'type': []}"
 
     if dataset == 'turl':
-        label_set = reduced_label_set
+        if args.label_space == 'freebase':
+            # the 255 Freebase names of the benchmark, the same label set as the other methods (type_vocab.txt of the shared data)
+            from sc_db_loader import ROOT as DATA_ROOT
+            label_set = [l.rstrip("\n").split("\t")[1].strip() for l in
+                         open(DATA_ROOT / "data" / "TURL-Wiki-CTA" / "type_vocab.txt", encoding="utf-8") if "\t" in l]
+        else:
+            label_set = reduced_label_set
         # RAG4CTA fix: `data_dir` (os.getenv('DATA_DIR', '.') + 'data') is
         # relative to whatever cwd the script happens to be launched from --
         # same class of bug as the module-level `data_path` fixed above with
@@ -138,6 +162,16 @@ def main():
         examples = [t for t in examples if any(g != '-1' for g in t['gold_types'])]
     if args.max_tables is not None:
         examples = examples[:args.max_tables]
+    only_cols = {(t, int(c)) for t, c in (x.rsplit(':', 1) for x in args.only.split(','))} if args.only else None
+    if args.only_file:
+        only_cols = set()
+        for line in open(args.only_file, encoding="utf-8"):
+            if line.strip():
+                t, c = line.rstrip("\n").split("\t")
+                only_cols.add((t, int(c)))
+    if only_cols:
+        wanted = {t for t, _ in only_cols}
+        examples = [e for e in examples if (e[0] if dataset == 'turl' else e['table_id']) in wanted]
     # `id` stays the index of the table in the full list, so the rows of all shards can be concatenated
     indexed = [(i, e) for i, e in enumerate(examples) if i % shard_n == shard_k]
 
@@ -145,12 +179,16 @@ def main():
         if dataset == 'turl':
             table_raw, table_with_en, label, headers, meta_data, num_col, max_num_row, colset = parse_example(example)
             targets = list(range(num_col))
+            if only_cols:
+                targets = [i for i in targets if (example[0], i) in only_cols]
         else:
             table_raw, num_col, colset = example['table_raw'], example['num_col'], None
             # RAG4CTA addition: only ask the model about columns that are
             # actually scored; the rest of the table is still full context
             # (CSV_like below still uses all num_col columns).
             targets = [i for i in range(num_col) if example['gold_types'][i] != '-1']
+            if only_cols:
+                targets = [i for i in targets if (example['table_id'], example['col_ids'][i]) in only_cols]
         x = min(len(table_raw), MAX_ROWS)  # only the first MAX_ROWS (6) rows of every column, for every dataset
         y = len(table_raw[0])
         table = []
@@ -166,8 +204,14 @@ def main():
         table_cols = table.copy()
         table = list(zip(*table))
         table_row = table.copy()
-        table = map(lambda x: ", ".join(x), table)
-        CSV_like = ",\n".join(table)
+        # RAG4CTA addition: a table that does not fit into the context of the server is shown to the LLM with shortened cells
+        # (the linking below keeps using the original cells); tables that fit are not touched
+        table_llm, fit_info = fit_rows(table_row, label_set)
+        if fit_info:
+            tid = example[0] if dataset == 'turl' else example['table_id']
+            with open(OUTPUT + ".truncated.jsonl", "a", encoding="utf-8") as tf:
+                tf.write(json.dumps({"table_id": tid, **fit_info}) + "\n")
+        CSV_like = table_to_text(table_llm)  # RAG4CTA: standard CSV quoting (env CSV_STYLE), see context_fit.py
 
         # --------------------- KG-Linker --------------------- #
         if context == "wikiAPI":
@@ -305,7 +349,7 @@ def main():
 
             chatgpt_msg = response(messages, model)
             prediction = chatgpt_msg.content
-            predicted_type = parse_pred_list(prediction) if multi else parse_pred(prediction)
+            predicted_type = resolve_to_label_set(parse_pred_list(prediction) if multi else parse_pred(prediction), label_set)
             messages.append(dict(chatgpt_msg))
             col_prompt_tok, col_completion_tok = last_usage["prompt_tokens"], last_usage["completion_tokens"]
 
@@ -315,10 +359,14 @@ def main():
                 chatgpt_msg = response(messages, model)
                 prediction = chatgpt_msg.content
                 messages.append(dict(chatgpt_msg))
-                predicted_type = parse_json_pred_list(prediction) if multi else parse_json_pred(prediction)
+                predicted_type = resolve_to_label_set(parse_json_pred_list(prediction) if multi else parse_json_pred(prediction), label_set)
                 col_prompt_tok += last_usage["prompt_tokens"]
                 col_completion_tok += last_usage["completion_tokens"]
 
+            if args.dump_dialog:
+                with open(args.dump_dialog, "a", encoding="utf-8") as dump:
+                    dump.write(json.dumps({"table_id": example['table_id'], "col_id": example['col_ids'][col], "hint": hint,
+                                           "messages": messages}, ensure_ascii=False, default=str) + "\n")
             if multi:  # the vocabulary types only, deduplicated, in the order given; stored as 'a;b;c'
                 predicted_type = ";".join(dict.fromkeys(t for t in predicted_type if t in label_set))
             return (predicted_type, prediction, col_prompt_tok, col_completion_tok)
@@ -334,7 +382,11 @@ def main():
             # `all_preds`/`hints` are in the order of `targets`, not 0..num_col-1
             # (for sc/db, non-evaluable columns were skipped entirely).
             for pos, (col_idx, p) in enumerate(zip(targets, all_preds)):
-                if dataset == 'turl':
+                if dataset == 'turl' and args.label_space == 'freebase':
+                    # table_id / column position / gold (Freebase names joined by ';' in gold order), like the other datasets
+                    writer.writerow([id, pos, p[0], hints[pos], p[1], p[2], p[3],
+                                      example[0], col_idx, ";".join(label[col_idx])])
+                elif dataset == 'turl':
                     writer.writerow([id, pos, p[0], hints[pos], p[1], p[2], p[3]])
                 else:
                     # RAG4CTA addition: carry table_id/col_id/gold_type, and

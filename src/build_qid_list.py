@@ -45,6 +45,7 @@ from utils import process_EL_res, parse_example  # noqa: E402
 
 UNITS = ["sc", "db", "turl_test", "turl_dev", "turl_train"]
 # datasets added later, scanned on their TEST split only (the only split RACOON annotates); cells separated by ';'
+SOTAB_UNIT = "sotab"  # SOTAB-CTA test: cells from the official V1 tables (sotab_cells.py), the shared file has no cell boundaries
 SHARED_TEST_UNITS = {"biodiv_db": "BiodivTab-DB-CTA", "biodiv_wiki": "BiodivTab-Wiki-CTA", "viznet": "VizNet-CTA"}
 TURL_FILES = {"turl_test": "test", "turl_dev": "dev", "turl_train": "train"}
 
@@ -106,6 +107,24 @@ def gittables_tables(subdir, splits=("train", "valid", "test")):
         yield tid, [[(columns[c][r] if r < len(columns[c]) else "") for c in range(len(columns))] for r in range(n_rows)], targets
 
 
+def sotab_tables():
+    """(table_id, rows, labeled column indices) for every table of the SOTAB-CTA test split. Structure and labels come from the
+    shared data/SOTAB-CTA/test.csv, the real cells (first MAX_ROWS) from the official tables, see sotab_cells.py."""
+    import sotab_cells
+    cells = sotab_cells.load("test")
+    csv.field_size_limit(sys.maxsize)
+    labeled: dict = {}
+    with open(RAG4CTA_ROOT / "data" / "SOTAB-CTA" / "test.csv", newline="", encoding="utf-8", errors="replace") as f:
+        for r in csv.DictReader(line.replace("\x00", "") for line in f):
+            labeled.setdefault(r["table_id"], {})[int(r["column_index"])] = _is_labeled(r["label"])
+    for tid, cols in labeled.items():
+        order = sorted(cols)
+        columns = [(cells.get(tid, {}).get(c) or [])[:MAX_ROWS] for c in order]
+        targets = [k for k, c in enumerate(order) if cols[c]]
+        n_rows = max(1, max((len(c) for c in columns), default=0))
+        yield tid, [[(columns[c][r] if r < len(columns[c]) else "") for c in range(len(columns))] for r in range(n_rows)], targets
+
+
 def turl_tables(split):
     base = RAG4CTA_ROOT / "data" / "WikiTables-TURL-CTA"
     with open(base / "type_vocab.txt", encoding="utf-8") as f:
@@ -124,6 +143,9 @@ def main():
     ap.add_argument("--units", default=",".join(UNITS))
     ap.add_argument("--max_tables", type=int, default=None, help="limit tables per unit (smoke test)")
     ap.add_argument("--shard", default=None, help="K/N: process only tables with index %% N == K (parallel jobs)")
+    ap.add_argument("--all_columns", action="store_true",
+                    help="link EVERY column of the table, like RACOON_CTA.py does (the default links only the labeled columns)")
+    ap.add_argument("--splits", default=None, help="comma separated splits for sc/db/biodiv units (default: unit specific)")
     ap.add_argument("--tag", default=None, help="name of this run; results go to qid_list.<tag>.json")
     args = ap.parse_args()
 
@@ -144,17 +166,20 @@ def main():
             continue
         if unit in TURL_FILES:
             tables = turl_tables(TURL_FILES[unit])
+        elif unit == SOTAB_UNIT:
+            tables = sotab_tables()
         elif unit in SHARED_TEST_UNITS:
             tables = gittables_tables(SHARED_TEST_UNITS[unit], splits=("test",))
         else:
-            tables = gittables_tables({"sc": "GitTablesSC", "db": "GitTablesDB"}[unit])
+            tables = gittables_tables({"sc": "GitTablesSC", "db": "GitTablesDB"}[unit],
+                                      splits=tuple(args.splits.split(",")) if args.splits else ("train", "valid", "test"))
         t0, n, failed, no_label = time.time(), 0, [], 0
         for table_index, (table_id, rows, targets) in enumerate(tables):
             if table_index % shard_n != shard_k:
                 continue
             try:
                 if targets:
-                    scan_table(table_id, rows, all_qids, targets)
+                    scan_table(table_id, rows, all_qids, None if args.all_columns else targets)
                 else:
                     no_label += 1  # no labeled column in this table: nothing to annotate
             except Exception as e:  # one odd table must not stop a run that takes hours
