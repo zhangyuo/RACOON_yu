@@ -5,7 +5,7 @@ Real cell boundaries of SOTAB-CTA for RACOON.
 The shared file data/SOTAB-CTA/test.csv joins the cells of a column with a plain space, so "first 6 cells" cannot be recovered
 from it. The tables themselves are public (SOTAB V1, CTA_Test.zip, https://data.dws.informatik.uni-mannheim.de/structureddata/sotab/CTA_Test.zip; one gzip
 JSON-lines file per table, one JSON object per row, keys = column positions). The shared test split is the V1 CTA test set
-(V2 has only 609 test tables); the shared train and valid files are not rebuilt here, RACOON only needs test. The table_id of the shared files is the official file name, so the cells
+(V2 has only 609 test tables); train and valid are rebuilt the same way from CTA_Training.zip / CTA_Validation.zip (needed by the few-shot / RAG / CoT baselines). The table_id of the shared files is the official file name, so the cells
 are read from there:
 
     python sotab_cells.py [split=test]      ->  <OFFICIAL_DIR>/<split>_first6_cells.json
@@ -28,7 +28,8 @@ from pathlib import Path
 
 ROOT = Path(os.getenv("RAG4CTA_ROOT", os.path.expanduser("~/RAG4CTA")))
 OFFICIAL_DIR = Path(os.getenv("OFFICIAL_DIR", "/nfs/srv/data2/af62lp@cs.aau.dk/cta_data/raw/SOTAB_official_v1"))
-ZIPS = ("CTA_Test.zip",)  # SOTAB V1 CTA test set: 7,026 tables, 15,040 annotated columns = the shared test split
+ZIPS = {"test": ("CTA_Test.zip",),  # SOTAB V1 CTA test set: 7,026 tables, 15,040 annotated columns = the shared test split
+        "train": ("CTA_Training.zip",), "valid": ("CTA_Validation.zip",)}
 MAX_ROWS = 6
 
 
@@ -61,7 +62,7 @@ def build(split: str = "test") -> Path:
         for r in csv.DictReader(line.replace("\x00", "") for line in f):
             need.add(r["table_id"])
     out: dict[str, dict[int, list[str]]] = {}
-    for name in ZIPS:
+    for name in ZIPS[split]:
         with zipfile.ZipFile(OFFICIAL_DIR / name) as z:
             for member in z.namelist():
                 tid = member.split("/")[-1]

@@ -72,10 +72,10 @@ def load_tables(dataset: str, split: str = "test") -> tuple[list[dict], list[str
 
     real_cells = None
     if dataset == "sotab":
-        if split != "test":
-            raise ValueError("sotab: the real cells exist for the test split only")
+        if split not in ("test", "train", "valid"):
+            raise ValueError("sotab: the real cells exist for the test, train and valid splits only")
         import sotab_cells
-        real_cells = sotab_cells.load("test")
+        real_cells = sotab_cells.load(split)
 
     by_table: dict[str, dict[int, tuple[list[str], list[str]]]] = {}
     for name in (_SPLITS if split == "all" else (split,)):
